@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stock-screener-dev": {
+      "command": "python",
+      "args": ["backend/app/mcp_server.py"]
+    }
+  }
+}

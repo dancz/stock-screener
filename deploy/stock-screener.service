@@ -1,0 +1,16 @@
+[Unit]
+Description=SwingPulse Daily US Stock Screener (FastAPI + Static SPA)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/stock-screener
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/pi/stock-screener/backend/.venv/bin/uvicorn app.main:app --app-dir /home/pi/stock-screener/backend --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

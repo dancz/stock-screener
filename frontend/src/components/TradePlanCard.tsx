@@ -1,0 +1,140 @@
+import React, { useEffect, useState } from "react";
+import { Calculator, Crosshair } from "lucide-react";
+import { useScreenerStore } from "../store/useScreenerStore";
+
+export const TradePlanCard: React.FC = () => {
+  const detail = useScreenerStore((s) => s.selectedDetail);
+  const settings = useScreenerStore((s) => s.settings);
+
+  const [equity, setEquity] = useState<number>(25000);
+  const [riskPct, setRiskPct] = useState<number>(1.0);
+
+  useEffect(() => {
+    if (settings?.account) {
+      setEquity(settings.account.equity ?? 25000);
+      setRiskPct(settings.account.risk_pct ?? 1.0);
+    }
+  }, [settings?.account]);
+
+  if (!detail || !detail.trade_plan || !detail.trade_plan.entry_low) return null;
+
+  const plan = detail.trade_plan;
+  const midEntry = (plan.entry_low + plan.entry_high) / 2;
+  const riskPerShare = Math.max(plan.risk_per_share || Math.abs(midEntry - plan.stop_loss), 0.01);
+  const maxDollarRisk = Math.max(0, equity * (riskPct / 100));
+  const shares = Math.max(0, Math.floor(maxDollarRisk / riskPerShare));
+  const positionValue = shares * midEntry;
+  const tp2Reward = Math.abs(plan.tp2 - midEntry) * shares;
+
+  const dirColor =
+    plan.direction === "LONG"
+      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
+      : plan.direction === "SHORT"
+      ? "bg-rose-500/15 text-rose-300 border-rose-500/40"
+      : "bg-sky-500/15 text-sky-300 border-sky-500/40";
+
+  return (
+    <section className="rounded-xl border border-border bg-panel p-4 flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Crosshair className="h-4 w-4 text-sky-400" />
+          <h2 className="text-sm font-bold text-white">Trade Plan & Position Sizing</h2>
+        </div>
+        <span className={`rounded border px-2 py-0.5 text-[11px] font-bold ${dirColor}`}>
+          {plan.direction} • {plan.risk_reward.toFixed(2)}R
+        </span>
+      </div>
+
+      <div className="rounded-lg bg-card/80 px-3 py-2">
+        <div className="text-xs font-semibold text-slate-200">{plan.setup_name}</div>
+        <div className="mt-0.5 text-[11px] text-slate-400">{plan.rationale}</div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <div className="rounded-lg border border-border/70 bg-canvas p-2.5">
+          <div className="text-[10px] uppercase tracking-wider text-slate-400">Entry Zone</div>
+          <div className="mt-0.5 tabular-nums text-xs font-bold text-sky-300">
+            ${plan.entry_low.toFixed(2)} – ${plan.entry_high.toFixed(2)}
+          </div>
+        </div>
+        <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2.5">
+          <div className="text-[10px] uppercase tracking-wider text-rose-300/80">Stop-Loss</div>
+          <div className="mt-0.5 tabular-nums text-xs font-bold text-rose-300">
+            ${plan.stop_loss.toFixed(2)}
+          </div>
+        </div>
+        <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
+          <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 1</div>
+          <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">
+            ${plan.tp1.toFixed(2)}
+          </div>
+        </div>
+        <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
+          <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 2</div>
+          <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">
+            ${plan.tp2.toFixed(2)}
+          </div>
+        </div>
+      </div>
+
+      {/* Interactive Position Sizing Calculator */}
+      <div className="rounded-lg border border-border/70 bg-canvas/80 p-3">
+        <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
+          <Calculator className="h-3.5 w-3.5 text-sky-400" />
+          <span>Position Sizing Calculator (ATR: ${plan.atr.toFixed(2)})</span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2.5 mb-2.5">
+          <label className="block">
+            <span className="text-[10px] text-slate-400">Account Equity ($)</span>
+            <input
+              type="number"
+              min={500}
+              step={500}
+              value={equity}
+              onChange={(e) => setEquity(Number(e.target.value) || 0)}
+              className="mt-0.5 w-full rounded border border-border bg-panel px-2 py-1 tabular-nums text-xs text-white focus:border-sky-500 focus:outline-none"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[10px] text-slate-400">Risk per Trade (%)</span>
+            <input
+              type="number"
+              min={0.1}
+              max={10}
+              step={0.25}
+              value={riskPct}
+              onChange={(e) => setRiskPct(Number(e.target.value) || 0)}
+              className="mt-0.5 w-full rounded border border-border bg-panel px-2 py-1 tabular-nums text-xs text-white focus:border-sky-500 focus:outline-none"
+            />
+          </label>
+        </div>
+
+        <div className="grid grid-cols-4 gap-2 text-center border-t border-border/60 pt-2">
+          <div>
+            <div className="text-[10px] text-slate-400">Shares</div>
+            <div className="tabular-nums text-xs font-bold text-white">{shares}</div>
+          </div>
+          <div>
+            <div className="text-[10px] text-slate-400">Position</div>
+            <div className="tabular-nums text-xs font-semibold text-slate-200">
+              ${positionValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-slate-400">Max Risk</div>
+            <div className="tabular-nums text-xs font-semibold text-rose-400">
+              -${maxDollarRisk.toFixed(0)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] text-slate-400">TP2 Gain</div>
+            <div className="tabular-nums text-xs font-semibold text-emerald-400">
+              +${tp2Reward.toFixed(0)}
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+};

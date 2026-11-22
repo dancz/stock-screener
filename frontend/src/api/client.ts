@@ -1,0 +1,136 @@
+import type {
+  CandleBar,
+  PluginDescriptor,
+  RuntimeSettings,
+  ScanStatus,
+  ScreenerResponse,
+  StockDetail,
+  Watchlist,
+} from "../types/screener";
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const resp = await fetch(path, {
+    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    ...init,
+  });
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`;
+    try {
+      const data = await resp.json();
+      msg = data.detail || data.message || msg;
+    } catch {
+      // ignore json parse failure
+    }
+    throw new Error(msg);
+  }
+  return resp.json() as Promise<T>;
+}
+
+export const api = {
+  getScreener(params: {
+    preset?: string;
+    watchlistId?: number | null;
+    signal?: string | null;
+    bias?: string | null;
+    excludeEarningsDays?: number | null;
+    search?: string;
+  }): Promise<ScreenerResponse> {
+    const qs = new URLSearchParams();
+    if (params.preset) qs.set("preset", params.preset);
+    if (params.watchlistId !== undefined && params.watchlistId !== null) {
+      qs.set("watchlist_id", String(params.watchlistId));
+    }
+    if (params.signal) qs.set("signal", params.signal);
+    if (params.bias) qs.set("bias", params.bias);
+    if (params.excludeEarningsDays !== undefined && params.excludeEarningsDays !== null) {
+      qs.set("exclude_earnings_days", String(params.excludeEarningsDays));
+    }
+    if (params.search) qs.set("search", params.search);
+    return request<ScreenerResponse>(`/api/screener?${qs.toString()}`);
+  },
+
+  getStockDetail(symbol: string): Promise<StockDetail> {
+    return request<StockDetail>(`/api/stocks/${encodeURIComponent(symbol)}`);
+  },
+
+  getCandles(symbol: string, timeframe: "1d" | "1h"): Promise<{ symbol: string; timeframe: string; candles: CandleBar[] }> {
+    return request(`/api/stocks/${encodeURIComponent(symbol)}/candles?timeframe=${timeframe}`);
+  },
+
+  refreshStock(symbol: string): Promise<StockDetail> {
+    return request<StockDetail>(`/api/stocks/${encodeURIComponent(symbol)}/refresh`, { method: "POST" });
+  },
+
+  saveNotes(symbol: string, noteText: string, tags: string[]): Promise<{ symbol: string; note_text: string; tags: string[] }> {
+    return request(`/api/stocks/${encodeURIComponent(symbol)}/notes`, {
+      method: "PUT",
+      body: JSON.stringify({ note_text: noteText, tags }),
+    });
+  },
+
+  getWatchlists(): Promise<{ watchlists: Watchlist[] }> {
+    return request("/api/watchlists");
+  },
+
+  createWatchlist(name: string, color = "#10b981"): Promise<Watchlist> {
+    return request("/api/watchlists", {
+      method: "POST",
+      body: JSON.stringify({ name, color }),
+    });
+  },
+
+  renameWatchlist(id: number, name: string): Promise<Watchlist> {
+    return request(`/api/watchlists/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    });
+  },
+
+  deleteWatchlist(id: number): Promise<{ deleted: boolean }> {
+    return request(`/api/watchlists/${id}`, { method: "DELETE" });
+  },
+
+  addToWatchlist(watchlistId: number, symbol: string): Promise<{ id: number; symbols: string[]; count: number }> {
+    return request(`/api/watchlists/${watchlistId}/items/${encodeURIComponent(symbol)}`, { method: "POST" });
+  },
+
+  removeFromWatchlist(watchlistId: number, symbol: string): Promise<{ id: number; symbols: string[]; count: number }> {
+    return request(`/api/watchlists/${watchlistId}/items/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+  },
+
+  triggerScan(mode: "quick" | "full" | "watchlists"): Promise<{ started: boolean; status: ScanStatus }> {
+    return request("/api/scan/run", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    });
+  },
+
+  getScanStatus(): Promise<ScanStatus> {
+    return request("/api/scan/status");
+  },
+
+  getSettings(): Promise<{ settings: RuntimeSettings; plugins: PluginDescriptor[] }> {
+    return request("/api/settings");
+  },
+
+  updateSettings(payload: Partial<RuntimeSettings>): Promise<{ settings: RuntimeSettings; plugins: PluginDescriptor[] }> {
+    return request("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  testIbkr(host: string, port: number, clientId: number): Promise<{ connected: boolean; message: string }> {
+    return request("/api/settings/test-ibkr", {
+      method: "POST",
+      body: JSON.stringify({ host, port, client_id: clientId }),
+    });
+  },
+
+  testNotifier(pluginId: string): Promise<{ ok: boolean; message: string }> {
+    return request("/api/settings/test-notifier", {
+      method: "POST",
+      body: JSON.stringify({ plugin_id: pluginId }),
+    });
+  },
+};
