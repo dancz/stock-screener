@@ -12,6 +12,9 @@ import type {
   ScreenerItem,
   SortBy,
   StockDetail,
+  TradeIdea,
+  TradeIdeaHorizon,
+  TradeIdeasResponse,
   Watchlist,
   WatchlistHorizon,
 } from "../types/screener";
@@ -29,6 +32,7 @@ export interface LayerVisibility {
 
 interface ScreenerState {
   // Navigation & Filters
+  activeView: "screener" | "trade_ideas";
   sidebarTab: "screener" | "watchlists";
   activePreset: string;
   sortBy: SortBy;
@@ -39,6 +43,15 @@ interface ScreenerState {
   excludeEarnings7d: boolean;
   indexAlignedOnly: boolean;
   searchFilter: string;
+
+  // Trade Ideas filters & data
+  tradeIdeas: TradeIdeasResponse | null;
+  loadingTradeIdeas: boolean;
+  ideaHorizon: TradeIdeaHorizon;
+  ideaMinRr: number;
+  ideaExcludeEarnings7d: boolean;
+  ideaIndexAlignedOnly: boolean;
+  ideaWatchlistOnly: boolean;
 
   // Data
   items: ScreenerItem[];
@@ -67,6 +80,18 @@ interface ScreenerState {
 
   // Actions
   init: () => Promise<void>;
+  setActiveView: (view: "screener" | "trade_ideas") => void;
+  fetchTradeIdeas: () => Promise<void>;
+  setIdeaFilters: (
+    partial: Partial<{
+      horizon: TradeIdeaHorizon;
+      minRr: number;
+      excludeEarnings7d: boolean;
+      indexAlignedOnly: boolean;
+      watchlistOnly: boolean;
+    }>
+  ) => Promise<void>;
+  openIdeaInScreener: (symbol: string) => Promise<void>;
   fetchScreener: () => Promise<void>;
   fetchWatchlists: () => Promise<void>;
   selectStock: (symbol: string) => Promise<void>;
@@ -98,6 +123,7 @@ interface ScreenerState {
 }
 
 export const useScreenerStore = create<ScreenerState>((set, get) => ({
+  activeView: "screener",
   sidebarTab: "screener",
   activePreset: "all_around_swing",
   sortBy: "score",
@@ -108,6 +134,14 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
   excludeEarnings7d: false,
   indexAlignedOnly: false,
   searchFilter: "",
+
+  tradeIdeas: null,
+  loadingTradeIdeas: false,
+  ideaHorizon: "all",
+  ideaMinRr: 1.5,
+  ideaExcludeEarnings7d: false,
+  ideaIndexAlignedOnly: false,
+  ideaWatchlistOnly: false,
 
   items: [],
   marketRegime: null,
@@ -145,10 +179,52 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       get().loadSettings(),
       get().fetchWatchlists(),
       get().fetchScreener(),
+      get().fetchTradeIdeas(),
       get().pollScanStatus(),
       get().fetchBackfillStatus(),
     ]);
     get().checkIbkrStatus();
+  },
+
+  setActiveView(view) {
+    set({ activeView: view });
+    if (view === "trade_ideas") {
+      get().fetchTradeIdeas();
+    }
+  },
+
+  async fetchTradeIdeas() {
+    const state = get();
+    set({ loadingTradeIdeas: true });
+    try {
+      const res = await api.getTradeIdeas({
+        limit: 10,
+        horizon: state.ideaHorizon,
+        minRr: state.ideaMinRr,
+        excludeEarningsDays: state.ideaExcludeEarnings7d ? 7 : null,
+        indexAlignedOnly: state.ideaIndexAlignedOnly,
+        watchlistOnly: state.ideaWatchlistOnly,
+      });
+      set({ tradeIdeas: res, loadingTradeIdeas: false });
+    } catch (err) {
+      set({ loadingTradeIdeas: false, error: (err as Error).message });
+    }
+  },
+
+  async setIdeaFilters(partial) {
+    set({
+      ...(partial.horizon !== undefined ? { ideaHorizon: partial.horizon } : {}),
+      ...(partial.minRr !== undefined ? { ideaMinRr: partial.minRr } : {}),
+      ...(partial.excludeEarnings7d !== undefined ? { ideaExcludeEarnings7d: partial.excludeEarnings7d } : {}),
+      ...(partial.indexAlignedOnly !== undefined ? { ideaIndexAlignedOnly: partial.indexAlignedOnly } : {}),
+      ...(partial.watchlistOnly !== undefined ? { ideaWatchlistOnly: partial.watchlistOnly } : {}),
+    });
+    await get().fetchTradeIdeas();
+  },
+
+  async openIdeaInScreener(symbol) {
+    set({ activeView: "screener" });
+    await get().selectStock(symbol);
   },
 
   async fetchScreener() {
@@ -241,7 +317,14 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
   async jumpToTicker(symbol) {
     const sym = symbol.trim().toUpperCase();
     if (!sym) return;
-    set({ selectedSymbol: sym, loadingDetail: true, loadingCandles: true, liveQuote: null, error: null });
+    set({
+      activeView: "screener",
+      selectedSymbol: sym,
+      loadingDetail: true,
+      loadingCandles: true,
+      liveQuote: null,
+      error: null,
+    });
     try {
       const [detail, candlesRes, quote] = await Promise.all([
         api.refreshStock(sym),
@@ -349,18 +432,25 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
         : [...detail.watchlist_ids, watchlistId];
       set({ selectedDetail: { ...detail, watchlist_ids: nextIds } });
     }
-    set((s) => ({
-      items: s.items.map((it) =>
-        it.symbol === sym
+    set((s) => {
+      const updateIds = (ids: number[]) =>
+        isMember ? ids.filter((id) => id !== watchlistId) : [...ids, watchlistId];
+      const patchIdea = (idea: TradeIdea): TradeIdea =>
+        idea.symbol === sym ? { ...idea, watchlist_ids: updateIds(idea.watchlist_ids) } : idea;
+
+      return {
+        items: s.items.map((it) =>
+          it.symbol === sym ? { ...it, watchlist_ids: updateIds(it.watchlist_ids) } : it
+        ),
+        tradeIdeas: s.tradeIdeas
           ? {
-              ...it,
-              watchlist_ids: isMember
-                ? it.watchlist_ids.filter((id) => id !== watchlistId)
-                : [...it.watchlist_ids, watchlistId],
+              ...s.tradeIdeas,
+              buys: s.tradeIdeas.buys.map(patchIdea),
+              sells: s.tradeIdeas.sells.map(patchIdea),
             }
-          : it
-      ),
-    }));
+          : null,
+      };
+    });
     if (get().sidebarTab === "watchlists") {
       await get().fetchScreener();
     }
@@ -415,7 +505,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       const status = await api.getScanStatus();
       set({ scanStatus: status });
       if (prevRunning && !status.running && status.stage === "completed") {
-        await get().fetchScreener();
+        await Promise.all([get().fetchScreener(), get().fetchTradeIdeas()]);
         const sel = get().selectedSymbol;
         if (sel) await get().selectStock(sel);
       }

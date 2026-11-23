@@ -2,6 +2,7 @@ export type Bias = "bullish" | "bearish" | "neutral";
 export type Severity = "high" | "medium" | "low" | "warning" | "info";
 export type SortBy = "score" | "risk_reward" | "potential_gain" | "tight_entry";
 export type WatchlistHorizon = "short_term" | "medium_term" | "general";
+export type TradeIdeaHorizon = "all" | "short_term" | "medium_term";
 
 export interface Signal {
   code: string;
@@ -341,4 +342,73 @@ export interface RuntimeSettings {
     discord_webhook_url: string;
     min_alert_score: number;
   };
+}
+
+export interface TradeIdeaReason {
+  category: string;
+  title: string;
+  detail: string;
+}
+
+export interface TradeIdeaOptionHint {
+  strategy_name: string;
+  expiry: string;
+  dte: number;
+  net_credit_debit: number;
+  max_profit: number | null;
+  max_loss: number | null;
+  pop_estimate: number | null;
+  iv_regime: string;
+  rationale: string;
+  earnings_warning: string | null;
+}
+
+export interface TradeIdea {
+  symbol: string;
+  name: string;
+  sector: string;
+  primary_benchmark: string;
+  last_price: number;
+  change_pct: number;
+  analyzed_at: string | null;
+  is_deep_enriched: boolean;
+  direction: "LONG" | "SHORT";
+  action: "BUY" | "SELL / SHORT";
+  conviction_score: number;
+  conviction_tier: string;
+  composite_score: number;
+  setup_name: string;
+  thesis: string;
+  entry_low: number;
+  entry_high: number;
+  stop_loss: number;
+  tp1: number;
+  tp2: number;
+  risk_reward: number;
+  risk_per_share: number;
+  potential_gain_pct: number;
+  tp1_gain_pct: number;
+  potential_loss_pct: number;
+  dist_to_support_pct: number | null;
+  dist_to_resistance_pct: number | null;
+  index_aligned: boolean;
+  index_trend: Bias;
+  days_to_earnings: number | null;
+  fundamental_grade: string | null;
+  reasons: TradeIdeaReason[];
+  watchouts: string[];
+  top_option: TradeIdeaOptionHint | null;
+  watchlist_ids: number[];
+}
+
+export interface TradeIdeasResponse {
+  generated_at: string;
+  disclaimer: string;
+  horizon: TradeIdeaHorizon;
+  min_rr: number;
+  market_regime: MarketRegime | null;
+  last_scan: ScreenerResponse["last_scan"];
+  total_scanned: number;
+  buys: TradeIdea[];
+  sells: TradeIdea[];
 }

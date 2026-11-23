@@ -8,6 +8,8 @@ import type {
   ScreenerResponse,
   SortBy,
   StockDetail,
+  TradeIdeaHorizon,
+  TradeIdeasResponse,
   Watchlist,
   WatchlistHorizon,
 } from "../types/screener";
@@ -55,6 +57,27 @@ export const api = {
     if (params.indexAlignedOnly) qs.set("index_aligned_only", "true");
     if (params.search) qs.set("search", params.search);
     return request<ScreenerResponse>(`/api/screener?${qs.toString()}`);
+  },
+
+  getTradeIdeas(params?: {
+    limit?: number;
+    horizon?: TradeIdeaHorizon;
+    minRr?: number;
+    excludeEarningsDays?: number | null;
+    indexAlignedOnly?: boolean;
+    watchlistOnly?: boolean;
+  }): Promise<TradeIdeasResponse> {
+    const qs = new URLSearchParams();
+    if (params?.limit) qs.set("limit", String(params.limit));
+    if (params?.horizon) qs.set("horizon", params.horizon);
+    if (params?.minRr !== undefined) qs.set("min_rr", String(params.minRr));
+    if (params?.excludeEarningsDays !== undefined && params?.excludeEarningsDays !== null) {
+      qs.set("exclude_earnings_days", String(params.excludeEarningsDays));
+    }
+    if (params?.indexAlignedOnly) qs.set("index_aligned_only", "true");
+    if (params?.watchlistOnly) qs.set("watchlist_only", "true");
+    const suffix = qs.toString();
+    return request<TradeIdeasResponse>(suffix ? `/api/trade-ideas?${suffix}` : "/api/trade-ideas");
   },
 
   getStockDetail(symbol: string): Promise<StockDetail> {

@@ -1,7 +1,9 @@
 import React, { useState } from "react";
 import {
   Activity,
+  BarChart3,
   ChevronDown,
+  Lightbulb,
   Loader2,
   Play,
   Radio,
@@ -19,6 +21,9 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenSettings }) => {
   const [tickerInput, setTickerInput] = useState("");
   const [scanMenuOpen, setScanMenuOpen] = useState(false);
 
+  const activeView = useScreenerStore((s) => s.activeView);
+  const setActiveView = useScreenerStore((s) => s.setActiveView);
+  const tradeIdeas = useScreenerStore((s) => s.tradeIdeas);
   const marketRegime = useScreenerStore((s) => s.marketRegime);
   const scanStatus = useScreenerStore((s) => s.scanStatus);
   const ibkrStatus = useScreenerStore((s) => s.ibkrStatus);
@@ -42,6 +47,7 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenSettings }) => {
       : "border-amber-500/40 bg-amber-500/15 text-amber-300";
 
   const isScanning = scanStatus?.running ?? false;
+  const ideasCount = (tradeIdeas?.buys?.length ?? 0) + (tradeIdeas?.sells?.length ?? 0);
   const pct =
     scanStatus && scanStatus.total > 0
       ? Math.min(100, Math.round((scanStatus.processed / scanStatus.total) * 100))
@@ -62,6 +68,50 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenSettings }) => {
         </div>
 
         <div className="h-6 w-px bg-border" />
+
+        {/* View Switcher */}
+        <nav
+          aria-label="Primary view switcher"
+          className="inline-flex shrink-0 items-center rounded-lg border border-border bg-canvas p-0.5"
+        >
+          <button
+            type="button"
+            onClick={() => setActiveView("screener")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+              activeView === "screener"
+                ? "bg-sky-600 text-white shadow-sm"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            <span>Screener &amp; Chart</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveView("trade_ideas")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+              activeView === "trade_ideas"
+                ? "bg-sky-600 text-white shadow-sm"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Lightbulb className="h-3.5 w-3.5" />
+            <span>Trade Ideas</span>
+            {ideasCount > 0 && (
+              <span
+                className={`rounded-full px-1.5 py-0 text-[10px] font-bold tabular-nums ${
+                  activeView === "trade_ideas"
+                    ? "bg-white/20 text-white"
+                    : "bg-sky-500/20 text-sky-300"
+                }`}
+              >
+                {ideasCount}
+              </span>
+            )}
+          </button>
+        </nav>
+
+        <div className="hidden h-6 w-px bg-border sm:block" />
 
         {/* Market Regime Strip */}
         <div className="flex items-center gap-2">
