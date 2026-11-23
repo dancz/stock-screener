@@ -13,7 +13,7 @@ export const TickerHeader: React.FC = () => {
 
   if (!detail) return null;
 
-  const presetScore = detail.preset_scores?.[activePreset] ?? detail.composite_score;
+  const presetScore = Number(detail.preset_scores?.[activePreset] ?? detail.composite_score ?? 0);
   const scoreClass =
     presetScore >= 72
       ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
@@ -30,8 +30,8 @@ export const TickerHeader: React.FC = () => {
       ? "Watch"
       : "Weak";
 
-  const displayPrice = liveQuote ? liveQuote.price : detail.last_price;
-  const displayChg = liveQuote ? liveQuote.change_pct : detail.change_pct;
+  const displayPrice = Number(liveQuote ? liveQuote.price : detail.last_price ?? 0);
+  const displayChg = Number(liveQuote ? liveQuote.change_pct : detail.change_pct ?? 0);
   const presetName = presets[activePreset]?.name || activePreset;
 
   return (

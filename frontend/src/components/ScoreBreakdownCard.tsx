@@ -27,7 +27,7 @@ export const ScoreBreakdownCard: React.FC = () => {
     })
     .sort((a, b) => b.contrib - a.contrib || b.plugin.score - a.plugin.score);
 
-  const presetTotal = detail.preset_scores?.[activePreset] ?? detail.composite_score;
+  const presetTotal = Number(detail.preset_scores?.[activePreset] ?? detail.composite_score ?? 0);
 
   return (
     <section className="rounded-xl border border-border bg-panel p-4 flex flex-col gap-3">

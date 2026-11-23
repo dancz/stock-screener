@@ -27,6 +27,37 @@ def get_watchlist_membership_map(session: Session) -> dict[str, list[int]]:
     return mapping
 
 
+def _normalize_trade_plan(raw_plan: dict[str, Any]) -> dict[str, Any]:
+    """Ensure legacy TradePlan snapshots include computed v2 gain/loss & index fields."""
+    if not raw_plan or "entry_low" not in raw_plan:
+        return {}
+    plan = dict(raw_plan)
+    entry_low = float(plan.get("entry_low") or 0.0)
+    entry_high = float(plan.get("entry_high") or entry_low)
+    mid = (entry_low + entry_high) / 2.0
+    stop_loss = float(plan.get("stop_loss") or 0.0)
+    tp1 = float(plan.get("tp1") or 0.0)
+    tp2 = float(plan.get("tp2") or 0.0)
+
+    if mid > 0:
+        if plan.get("potential_gain_pct") is None:
+            plan["potential_gain_pct"] = round(abs(tp2 - mid) / mid * 100.0, 2)
+        if plan.get("tp1_gain_pct") is None:
+            plan["tp1_gain_pct"] = round(abs(tp1 - mid) / mid * 100.0, 2)
+        if plan.get("potential_loss_pct") is None:
+            plan["potential_loss_pct"] = round(abs(mid - stop_loss) / mid * 100.0, 2)
+    else:
+        plan.setdefault("potential_gain_pct", 0.0)
+        plan.setdefault("tp1_gain_pct", 0.0)
+        plan.setdefault("potential_loss_pct", 0.0)
+
+    plan.setdefault("index_aligned", False)
+    plan.setdefault("index_trend", "neutral")
+    plan.setdefault("dist_to_support_pct", None)
+    plan.setdefault("dist_to_resistance_pct", None)
+    return plan
+
+
 def serialize_snapshot_summary(
     snap: AnalysisSnapshot,
     ticker: Ticker,
@@ -37,7 +68,7 @@ def serialize_snapshot_summary(
     signals = json.loads(snap.signals_json or "[]")
     risk_flags = json.loads(snap.risk_flags_json or "[]")
     events_insiders = json.loads(snap.events_insiders_json or "{}")
-    trade_plan = json.loads(snap.trade_plan_json or "{}")
+    trade_plan = _normalize_trade_plan(json.loads(snap.trade_plan_json or "{}"))
 
     score = float(preset_scores.get(preset_id, snap.composite_score))
     return {
@@ -98,7 +129,7 @@ def serialize_snapshot_detail(
         "signals": json.loads(snap.signals_json or "[]"),
         "risk_flags": json.loads(snap.risk_flags_json or "[]"),
         "overlays": json.loads(snap.overlays_json or "[]"),
-        "trade_plan": json.loads(snap.trade_plan_json or "{}"),
+        "trade_plan": _normalize_trade_plan(json.loads(snap.trade_plan_json or "{}")),
         "options": json.loads(snap.option_proposals_json or "{}"),
         "fundamentals": json.loads(snap.fundamentals_json or "{}"),
         "events_insiders": json.loads(snap.events_insiders_json or "{}"),

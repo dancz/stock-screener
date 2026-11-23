@@ -16,15 +16,43 @@ export const TradePlanCard: React.FC = () => {
     }
   }, [settings?.account]);
 
-  if (!detail || !detail.trade_plan || !detail.trade_plan.entry_low) return null;
+  if (!detail || !detail.trade_plan || detail.trade_plan.entry_low == null) return null;
 
   const plan = detail.trade_plan;
-  const midEntry = (plan.entry_low + plan.entry_high) / 2;
-  const riskPerShare = Math.max(plan.risk_per_share || Math.abs(midEntry - plan.stop_loss), 0.01);
+  const entryLow = Number(plan.entry_low ?? 0);
+  const entryHigh = Number(plan.entry_high ?? entryLow);
+  const stopLoss = Number(plan.stop_loss ?? 0);
+  const tp1 = Number(plan.tp1 ?? 0);
+  const tp2 = Number(plan.tp2 ?? 0);
+  const rr = Number(plan.risk_reward ?? 0);
+  const atr = Number(plan.atr ?? 0);
+
+  const midEntry = (entryLow + entryHigh) / 2;
+  const riskPerShare = Math.max(Number(plan.risk_per_share ?? 0) || Math.abs(midEntry - stopLoss), 0.01);
   const maxDollarRisk = Math.max(0, equity * (riskPct / 100));
   const shares = Math.max(0, Math.floor(maxDollarRisk / riskPerShare));
   const positionValue = shares * midEntry;
-  const tp2Reward = Math.abs(plan.tp2 - midEntry) * shares;
+  const tp2Reward = Math.abs(tp2 - midEntry) * shares;
+
+  const lossPct =
+    plan.potential_loss_pct != null
+      ? Number(plan.potential_loss_pct)
+      : midEntry > 0
+      ? (Math.abs(midEntry - stopLoss) / midEntry) * 100
+      : 0;
+  const tp1GainPct =
+    plan.tp1_gain_pct != null
+      ? Number(plan.tp1_gain_pct)
+      : midEntry > 0
+      ? (Math.abs(tp1 - midEntry) / midEntry) * 100
+      : 0;
+  const tp2GainPct =
+    plan.potential_gain_pct != null
+      ? Number(plan.potential_gain_pct)
+      : midEntry > 0
+      ? (Math.abs(tp2 - midEntry) / midEntry) * 100
+      : 0;
+  const indexTrend = plan.index_trend ?? "neutral";
 
   const dirColor =
     plan.direction === "LONG"
@@ -51,10 +79,10 @@ export const TradePlanCard: React.FC = () => {
             <TrendingUp className="h-3 w-3" />
             {plan.index_aligned
               ? `${detail.primary_benchmark} Aligned`
-              : `Index: ${plan.index_trend}`}
+              : `Index: ${indexTrend}`}
           </span>
           <span className={`rounded border px-2 py-0.5 text-[11px] font-bold tabular-nums ${dirColor}`}>
-            {plan.direction} • {plan.risk_reward.toFixed(2)}R
+            {plan.direction} • {rr.toFixed(2)}R
           </span>
         </div>
       </div>
@@ -68,39 +96,40 @@ export const TradePlanCard: React.FC = () => {
         <div className="rounded-lg border border-border/70 bg-canvas p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-slate-400">Entry Zone</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-sky-300">
-            ${plan.entry_low.toFixed(2)} – ${plan.entry_high.toFixed(2)}
+            ${entryLow.toFixed(2)} – ${entryHigh.toFixed(2)}
           </div>
           {plan.dist_to_support_pct != null && (
             <div className="mt-0.5 text-[10px] text-slate-400 tabular-nums">
-              Sup {plan.dist_to_support_pct.toFixed(1)}% / Res {plan.dist_to_resistance_pct?.toFixed(1) ?? "—"}%
+              Sup {Number(plan.dist_to_support_pct).toFixed(1)}% / Res{" "}
+              {plan.dist_to_resistance_pct != null ? Number(plan.dist_to_resistance_pct).toFixed(1) : "—"}%
             </div>
           )}
         </div>
         <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-rose-300/80">Stop-Loss</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-rose-300">
-            ${plan.stop_loss.toFixed(2)}
+            ${stopLoss.toFixed(2)}
           </div>
           <div className="mt-0.5 tabular-nums text-[10px] font-medium text-rose-400">
-            -{plan.potential_loss_pct.toFixed(1)}% Risk
+            -{lossPct.toFixed(1)}% Risk
           </div>
         </div>
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 1</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">
-            ${plan.tp1.toFixed(2)}
+            ${tp1.toFixed(2)}
           </div>
           <div className="mt-0.5 tabular-nums text-[10px] font-medium text-emerald-400">
-            +{plan.tp1_gain_pct.toFixed(1)}% Gain
+            +{tp1GainPct.toFixed(1)}% Gain
           </div>
         </div>
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 2</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">
-            ${plan.tp2.toFixed(2)}
+            ${tp2.toFixed(2)}
           </div>
           <div className="mt-0.5 tabular-nums text-[10px] font-medium text-emerald-400">
-            +{plan.potential_gain_pct.toFixed(1)}% Gain
+            +{tp2GainPct.toFixed(1)}% Gain
           </div>
         </div>
       </div>
@@ -109,7 +138,7 @@ export const TradePlanCard: React.FC = () => {
       <div className="rounded-lg border border-border/70 bg-canvas/80 p-3">
         <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
           <Calculator className="h-3.5 w-3.5 text-sky-400" />
-          <span>Position Sizing Calculator (ATR: ${plan.atr.toFixed(2)})</span>
+          <span>Position Sizing Calculator (ATR: ${atr.toFixed(2)})</span>
         </div>
 
         <div className="grid grid-cols-2 gap-2.5 mb-2.5">

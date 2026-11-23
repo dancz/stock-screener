@@ -366,24 +366,24 @@ export const LeftSidebar: React.FC = () => {
                 <div className="flex items-center gap-2 shrink-0">
                   <div className="text-right">
                     <div className="tabular-nums text-xs font-semibold text-slate-100">
-                      ${item.last_price.toFixed(2)}
+                      ${Number(item.last_price ?? 0).toFixed(2)}
                     </div>
                     <div
                       className={`tabular-nums text-[11px] font-medium ${
-                        item.change_pct >= 0 ? "text-emerald-400" : "text-rose-400"
+                        Number(item.change_pct ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"
                       }`}
                     >
-                      {item.change_pct >= 0 ? "+" : ""}
-                      {item.change_pct.toFixed(2)}%
+                      {Number(item.change_pct ?? 0) >= 0 ? "+" : ""}
+                      {Number(item.change_pct ?? 0).toFixed(2)}%
                     </div>
                   </div>
 
                   <div
                     className={`flex h-8 w-9 items-center justify-center rounded-md border tabular-nums text-xs font-bold ${scoreColor(
-                      item.score
+                      Number(item.score ?? 0)
                     )}`}
                   >
-                    {Math.round(item.score)}
+                    {Math.round(Number(item.score ?? 0))}
                   </div>
 
                   <WatchlistPopover symbol={item.symbol} watchlistIds={item.watchlist_ids} compact />
@@ -391,11 +391,11 @@ export const LeftSidebar: React.FC = () => {
               </div>
 
               {/* Compact R:R & Potential Gain/Loss line */}
-              {item.risk_reward > 0 && (
+              {Number(item.risk_reward ?? 0) > 0 && (
                 <div className="mt-1 flex items-center gap-2 tabular-nums text-[10px] text-slate-400">
-                  <span className="font-semibold text-sky-300">R:R {item.risk_reward.toFixed(1)}x</span>
-                  <span className="text-emerald-400">+{item.potential_gain_pct.toFixed(1)}%</span>
-                  <span className="text-rose-400">-{item.potential_loss_pct.toFixed(1)}%</span>
+                  <span className="font-semibold text-sky-300">R:R {Number(item.risk_reward ?? 0).toFixed(1)}x</span>
+                  <span className="text-emerald-400">+{Number(item.potential_gain_pct ?? 0).toFixed(1)}%</span>
+                  <span className="text-rose-400">-{Number(item.potential_loss_pct ?? 0).toFixed(1)}%</span>
                 </div>
               )}
 

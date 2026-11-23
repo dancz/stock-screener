@@ -55,10 +55,13 @@ def test_api_screener_watchlists_notes_and_settings(tmp_path: Path):
         assert scr["total"] == 1
         assert scr["items"][0]["symbol"] == "AAPL"
 
-        # Stock detail
+        # Stock detail (also verifies legacy trade_plan without v2 pct fields is normalized!)
         det = client.get("/api/stocks/AAPL?enrich=false").json()
         assert det["symbol"] == "AAPL"
         assert det["composite_score"] == 82.5
+        assert det["trade_plan"]["potential_gain_pct"] > 0
+        assert det["trade_plan"]["tp1_gain_pct"] > 0
+        assert det["trade_plan"]["potential_loss_pct"] > 0
 
         # Custom Watchlist CRUD & multi-list membership
         wl_resp = client.post("/api/watchlists", json={"name": "Channel Bounces", "color": "#38bdf8"})

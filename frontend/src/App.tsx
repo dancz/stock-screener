@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Play, Sparkles } from "lucide-react";
 import { CorrelationCard } from "./components/CorrelationCard";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { EventsInsidersCard } from "./components/EventsInsidersCard";
 import { FundamentalsCard } from "./components/FundamentalsCard";
 import { LeftSidebar } from "./components/LeftSidebar";
@@ -20,6 +21,7 @@ export function App() {
   const init = useScreenerStore((s) => s.init);
   const pollScanStatus = useScreenerStore((s) => s.pollScanStatus);
   const scanRunning = useScreenerStore((s) => s.scanStatus?.running ?? false);
+  const selectedSymbol = useScreenerStore((s) => s.selectedSymbol);
   const selectedDetail = useScreenerStore((s) => s.selectedDetail);
   const items = useScreenerStore((s) => s.items);
   const loadingDetail = useScreenerStore((s) => s.loadingDetail);
@@ -81,21 +83,23 @@ export function App() {
               </div>
             </div>
           ) : (
-            <div className="mx-auto max-w-[1440px] space-y-4 pb-8">
-              <TickerHeader />
-              <StockChart />
+            <ErrorBoundary resetKey={selectedSymbol ?? ""}>
+              <div className="mx-auto max-w-[1440px] space-y-4 pb-8">
+                <TickerHeader />
+                <StockChart />
 
-              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-                <TradePlanCard />
-                <ScoreBreakdownCard />
-                <OptionsCard />
-                <CorrelationCard />
-                <FundamentalsCard />
-                <EventsInsidersCard />
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                  <TradePlanCard />
+                  <ScoreBreakdownCard />
+                  <OptionsCard />
+                  <CorrelationCard />
+                  <FundamentalsCard />
+                  <EventsInsidersCard />
+                </div>
+
+                <NotesTagsCard />
               </div>
-
-              <NotesTagsCard />
-            </div>
+            </ErrorBoundary>
           )}
         </main>
       </div>
