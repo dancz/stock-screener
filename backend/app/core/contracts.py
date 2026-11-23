@@ -67,6 +67,10 @@ class ChartOverlay(BaseModel):
 class TradeHints(BaseModel):
     nearest_support: float | None = None
     nearest_resistance: float | None = None
+    support_zone_low: float | None = None
+    support_zone_high: float | None = None
+    resistance_zone_low: float | None = None
+    resistance_zone_high: float | None = None
     channel_lower: float | None = None
     channel_upper: float | None = None
     channel_mid: float | None = None
@@ -135,11 +139,17 @@ class TradePlan(BaseModel):
     tp1: float
     tp2: float
     risk_reward: float
+    tp1_risk_reward: float = 0.0
     atr: float
     risk_per_share: float
     potential_gain_pct: float = 0.0
     tp1_gain_pct: float = 0.0
     potential_loss_pct: float = 0.0
+    spot_risk_pct: float | None = None
+    spot_rr_tp1: float | None = None
+    spot_rr_tp2: float | None = None
+    stop_distance_atr: float | None = None
+    target_crosses_barrier: bool = False
     dist_to_support_pct: float | None = None
     dist_to_resistance_pct: float | None = None
     index_aligned: bool = False

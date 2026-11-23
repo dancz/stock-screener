@@ -657,6 +657,15 @@ class SmartMoneyZonesAnalyzer(AnalyzerPlugin):
             ),
         }
 
+        dir_signals = [
+            s
+            for s in signals
+            if s.direction == bias and s.code not in ("SMC_DISCOUNT_ZONE", "SMC_PREMIUM_ZONE")
+        ]
+        if not dir_signals:
+            dir_signals = [s for s in signals if s.direction == bias]
+        smc_setup_name = dir_signals[0].label if dir_signals else f"SMC {swing_str} Structure"
+
         hints = TradeHints(
             nearest_support=round(nearest_bull_ob.bar_high, 2) if nearest_bull_ob else None,
             nearest_resistance=round(nearest_bear_ob.bar_low, 2) if nearest_bear_ob else None,
@@ -668,7 +677,7 @@ class SmartMoneyZonesAnalyzer(AnalyzerPlugin):
             else None,
             swing_trend="bullish" if swing_trend == 1 else ("bearish" if swing_trend == -1 else "neutral"),
             atr=round(atr14, 4),
-            setup_name=signals[0].label if signals else f"SMC {swing_str} Structure",
+            setup_name=smc_setup_name,
             bias=bias,
         )
 

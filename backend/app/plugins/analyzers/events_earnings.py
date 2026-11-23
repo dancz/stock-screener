@@ -92,17 +92,34 @@ class EventsEarningsAnalyzer(AnalyzerPlugin):
                 )
 
         score = min(95.0, max(15.0, score))
-        summary = (
-            f"Earnings in {days_to_earn}d ({next_earn})"
-            if days_to_earn is not None and days_to_earn >= 0
-            else "No imminent earnings date detected"
-        )
+        if days_to_earn is not None and days_to_earn > 0:
+            summary = f"Earnings in {days_to_earn}d ({next_earn})"
+        elif days_to_earn == 0:
+            summary = f"Earnings Today ({next_earn})"
+        elif days_to_earn is not None and days_to_earn < 0:
+            summary = f"Last earnings reported {abs(days_to_earn)}d ago ({next_earn})"
+        else:
+            summary = "No imminent earnings date detected"
+
+        if next_earn and days_to_earn is not None:
+            if days_to_earn < 0:
+                earn_label = "Last Earnings"
+                earn_formatted = f"{next_earn} (Reported {abs(days_to_earn)}d ago)"
+            elif days_to_earn == 0:
+                earn_label = "Next Earnings"
+                earn_formatted = f"{next_earn} (Today)"
+            else:
+                earn_label = "Next Earnings"
+                earn_formatted = f"{next_earn} ({days_to_earn}d)"
+        else:
+            earn_label = "Next Earnings"
+            earn_formatted = next_earn or "N/A"
 
         metrics = {
             "next_earnings_date": MetricItem(
-                label="Next Earnings",
+                label=earn_label,
                 value=next_earn,
-                formatted=f"{next_earn} ({days_to_earn}d)" if next_earn and days_to_earn is not None else (next_earn or "N/A"),
+                formatted=earn_formatted,
                 status="bad" if (days_to_earn is not None and 0 <= days_to_earn <= 7) else "neutral",
             ),
             "ex_dividend_date": MetricItem(

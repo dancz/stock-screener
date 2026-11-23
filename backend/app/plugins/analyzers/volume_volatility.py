@@ -54,8 +54,9 @@ class VolumeVolatilityAnalyzer(AnalyzerPlugin):
         ema200 = closes.ewm(span=200, adjust=False).mean()
 
         e20, e50, e200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
-        bull_stack = last_close > e20 > e50 and (len(work) < 120 or e50 > e200)
-        bear_stack = last_close < e20 < e50 and (len(work) < 120 or e50 < e200)
+        has_ema200 = len(work) >= 120
+        bull_stack = last_close > e20 > e50 and (not has_ema200 or e50 > e200)
+        bear_stack = last_close < e20 < e50 and (not has_ema200 or e50 < e200)
 
         # Relative Volume (RVOL)
         avg_vol_20 = float(vols.iloc[-21:-1].mean()) if len(vols) >= 21 else float(vols.mean())
@@ -99,44 +100,78 @@ class VolumeVolatilityAnalyzer(AnalyzerPlugin):
         if bull_stack:
             score += 14.0
             bias = "bullish"
+            stack_label = "Bullish EMA Stack (20>50>200)" if has_ema200 else "Bullish EMA Stack (20>50)"
+            stack_detail = (
+                f"Price ${last_close:.2f} > EMA20 (${e20:.2f}) > EMA50 (${e50:.2f}) > EMA200 (${e200:.2f})."
+                if has_ema200
+                else f"Price ${last_close:.2f} > EMA20 (${e20:.2f}) > EMA50 (${e50:.2f})."
+            )
             signals.append(
                 Signal(
                     code="BULLISH_EMA_STACK",
-                    label="Bullish EMA Stack (20>50>200)",
+                    label=stack_label,
                     direction="bullish",
                     severity="medium",
                     score_impact=14.0,
-                    detail=f"Price ${last_close:.2f} above EMA20 (${e20:.2f}) > EMA50 (${e50:.2f}).",
+                    detail=stack_detail,
                 )
             )
         elif bear_stack:
             score += 10.0
             bias = "bearish"
+            stack_label = "Bearish EMA Stack (20<50<200)" if has_ema200 else "Bearish EMA Stack (20<50)"
+            stack_detail = (
+                f"Price ${last_close:.2f} < EMA20 (${e20:.2f}) < EMA50 (${e50:.2f}) < EMA200 (${e200:.2f})."
+                if has_ema200
+                else f"Price ${last_close:.2f} < EMA20 (${e20:.2f}) < EMA50 (${e50:.2f})."
+            )
             signals.append(
                 Signal(
                     code="BEARISH_EMA_STACK",
-                    label="Bearish EMA Stack (20<50<200)",
+                    label=stack_label,
                     direction="bearish",
                     severity="medium",
                     score_impact=10.0,
-                    detail=f"Price ${last_close:.2f} below EMA20 (${e20:.2f}) < EMA50 (${e50:.2f}).",
+                    detail=stack_detail,
                 )
             )
 
         if rvol >= 1.5:
             pts = 16.0 if rvol >= 2.0 else 10.0
-            score += pts
-            sig_dir = "bullish" if float(closes.iloc[-1]) >= float(work["open"].iloc[-1]) else "bearish"
-            if bias == "neutral":
+            prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else float(work["open"].iloc[-1])
+            day_chg_pct = ((last_close / prev_close) - 1.0) * 100.0 if prev_close > 0 else 0.0
+            bar_open = float(work["open"].iloc[-1])
+            bar_low = float(lows.iloc[-1])
+            bar_high = float(highs.iloc[-1])
+            close_pos = (last_close - bar_low) / max(bar_high - bar_low, 1e-6)
+
+            if (day_chg_pct >= 1.0 and close_pos >= 0.45) or (last_close > bar_open and day_chg_pct >= 0.0):
+                sig_dir = "bullish"
+                vol_kind = "Buying Volume Spike"
+            elif (day_chg_pct <= -1.0 and close_pos <= 0.55) or (last_close < bar_open and day_chg_pct <= 0.0):
+                sig_dir = "bearish"
+                vol_kind = "Selling Volume Spike"
+            else:
+                sig_dir = "neutral"
+                vol_kind = "Mixed / Climax Volume Spike"
+
+            if sig_dir != "neutral":
+                score += pts
+            else:
+                score += 4.0
+            if bias == "neutral" and sig_dir != "neutral":
                 bias = sig_dir
             signals.append(
                 Signal(
                     code="HIGH_RVOL",
-                    label=f"Volume Spike ({rvol:.1f}x)",
+                    label=f"{vol_kind} ({rvol:.1f}x)",
                     direction=sig_dir,
-                    severity="high" if rvol >= 2.0 else "medium",
-                    score_impact=pts,
-                    detail=f"Volume is {rvol:.2f}x the 20-day average.",
+                    severity="high" if rvol >= 2.0 and sig_dir != "neutral" else "medium",
+                    score_impact=pts if sig_dir != "neutral" else 4.0,
+                    detail=(
+                        f"Volume is {rvol:.2f}x the 20d avg on a {day_chg_pct:+.1f}% 1D move "
+                        f"(closed at {close_pos * 100:.0f}% of daily range)."
+                    ),
                 )
             )
 

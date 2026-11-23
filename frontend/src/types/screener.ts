@@ -64,11 +64,17 @@ export interface TradePlan {
   tp1: number;
   tp2: number;
   risk_reward: number;
+  tp1_risk_reward?: number;
   atr: number;
   risk_per_share: number;
   potential_gain_pct: number;
   tp1_gain_pct: number;
   potential_loss_pct: number;
+  spot_risk_pct?: number | null;
+  spot_rr_tp1?: number | null;
+  spot_rr_tp2?: number | null;
+  stop_distance_atr?: number | null;
+  target_crosses_barrier?: boolean;
   dist_to_support_pct: number | null;
   dist_to_resistance_pct: number | null;
   index_aligned: boolean;
@@ -350,10 +356,20 @@ export interface TradeIdeaReason {
   detail: string;
 }
 
+export interface TradeIdeaOptionLeg {
+  action: "BUY" | "SELL" | string;
+  option_type: "CALL" | "PUT" | string;
+  strike: number;
+  mid_price: number;
+  delta: number | null;
+}
+
 export interface TradeIdeaOptionHint {
   strategy_name: string;
   expiry: string;
   dte: number;
+  legs: TradeIdeaOptionLeg[];
+  breakeven: number[];
   net_credit_debit: number;
   max_profit: number | null;
   max_loss: number | null;
@@ -377,6 +393,7 @@ export interface TradeIdea {
   conviction_score: number;
   conviction_tier: string;
   composite_score: number;
+  has_conflict: boolean;
   setup_name: string;
   thesis: string;
   entry_low: number;
@@ -385,10 +402,15 @@ export interface TradeIdea {
   tp1: number;
   tp2: number;
   risk_reward: number;
+  tp1_risk_reward: number;
   risk_per_share: number;
   potential_gain_pct: number;
   tp1_gain_pct: number;
   potential_loss_pct: number;
+  spot_risk_pct: number | null;
+  spot_rr_tp1: number | null;
+  spot_rr_tp2: number | null;
+  stop_distance_atr: number | null;
   dist_to_support_pct: number | null;
   dist_to_resistance_pct: number | null;
   index_aligned: boolean;
@@ -406,6 +428,8 @@ export interface TradeIdeasResponse {
   disclaimer: string;
   horizon: TradeIdeaHorizon;
   min_rr: number;
+  hide_conflicted?: boolean;
+  filtered_conflicted_count?: number;
   market_regime: MarketRegime | null;
   last_scan: ScreenerResponse["last_scan"];
   total_scanned: number;

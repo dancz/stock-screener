@@ -240,22 +240,36 @@ def fetch_fundamentals_and_events(symbol: str) -> tuple[dict[str, Any], dict[str
             cal = tk.calendar
             if isinstance(cal, dict):
                 ed_list = cal.get("Earnings Date") or []
-                if ed_list:
-                    ed = ed_list[0]
+                parsed_dates: list[tuple[datetime, int]] = []
+                for ed in ed_list:
                     ed_dt = _coerce_datetime(ed)
                     if ed_dt is not None:
-                        next_earnings_iso = ed_dt.date().isoformat()
-                        days_to_earnings = (ed_dt.date() - now_dt.date()).days
+                        parsed_dates.append((ed_dt, (ed_dt.date() - now_dt.date()).days))
+                if parsed_dates:
+                    future_dates = [p for p in parsed_dates if p[1] >= 0]
+                    chosen_dt, chosen_days = (
+                        min(future_dates, key=lambda p: p[1])
+                        if future_dates
+                        else max(parsed_dates, key=lambda p: p[1])
+                    )
+                    next_earnings_iso = chosen_dt.date().isoformat()
+                    days_to_earnings = chosen_days
         except Exception:
             pass
 
-        if next_earnings_iso is None:
-            ts_earn = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-            if ts_earn:
+        if next_earnings_iso is None or (days_to_earnings is not None and days_to_earnings < 0):
+            for ts_key in ("earningsTimestampStart", "earningsTimestamp"):
+                ts_earn = info.get(ts_key)
+                if not ts_earn:
+                    continue
                 try:
                     ed_dt = datetime.fromtimestamp(float(ts_earn), tz=timezone.utc)
-                    next_earnings_iso = ed_dt.date().isoformat()
-                    days_to_earnings = (ed_dt.date() - now_dt.date()).days
+                    cand_days = (ed_dt.date() - now_dt.date()).days
+                    if next_earnings_iso is None or cand_days >= 0:
+                        next_earnings_iso = ed_dt.date().isoformat()
+                        days_to_earnings = cand_days
+                        if cand_days >= 0:
+                            break
                 except Exception:
                     pass
 

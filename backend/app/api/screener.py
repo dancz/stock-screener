@@ -130,6 +130,7 @@ def get_trade_ideas(
     exclude_earnings_days: int | None = Query(default=None, ge=0, le=60),
     index_aligned_only: bool = Query(default=False),
     watchlist_only: bool = Query(default=False),
+    hide_conflicted: bool = Query(default=True),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     data = build_trade_ideas(
@@ -140,6 +141,7 @@ def get_trade_ideas(
         exclude_earnings_days=exclude_earnings_days,
         index_aligned_only=index_aligned_only,
         watchlist_only=watchlist_only,
+        hide_conflicted=hide_conflicted,
     )
     data["last_scan"] = _serialize_last_scan(db)
     return data

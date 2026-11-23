@@ -52,6 +52,7 @@ interface ScreenerState {
   ideaExcludeEarnings7d: boolean;
   ideaIndexAlignedOnly: boolean;
   ideaWatchlistOnly: boolean;
+  ideaHideConflicted: boolean;
 
   // Data
   items: ScreenerItem[];
@@ -89,6 +90,7 @@ interface ScreenerState {
       excludeEarnings7d: boolean;
       indexAlignedOnly: boolean;
       watchlistOnly: boolean;
+      hideConflicted: boolean;
     }>
   ) => Promise<void>;
   openIdeaInScreener: (symbol: string) => Promise<void>;
@@ -142,6 +144,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
   ideaExcludeEarnings7d: false,
   ideaIndexAlignedOnly: false,
   ideaWatchlistOnly: false,
+  ideaHideConflicted: true,
 
   items: [],
   marketRegime: null,
@@ -204,6 +207,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
         excludeEarningsDays: state.ideaExcludeEarnings7d ? 7 : null,
         indexAlignedOnly: state.ideaIndexAlignedOnly,
         watchlistOnly: state.ideaWatchlistOnly,
+        hideConflicted: state.ideaHideConflicted,
       });
       set({ tradeIdeas: res, loadingTradeIdeas: false });
     } catch (err) {
@@ -218,6 +222,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       ...(partial.excludeEarnings7d !== undefined ? { ideaExcludeEarnings7d: partial.excludeEarnings7d } : {}),
       ...(partial.indexAlignedOnly !== undefined ? { ideaIndexAlignedOnly: partial.indexAlignedOnly } : {}),
       ...(partial.watchlistOnly !== undefined ? { ideaWatchlistOnly: partial.watchlistOnly } : {}),
+      ...(partial.hideConflicted !== undefined ? { ideaHideConflicted: partial.hideConflicted } : {}),
     });
     await get().fetchTradeIdeas();
   },

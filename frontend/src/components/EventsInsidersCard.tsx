@@ -31,7 +31,15 @@ export const EventsInsidersCard: React.FC = () => {
             }`}
           >
             {ev.next_earnings_date
-              ? `${ev.next_earnings_date}${ev.days_to_earnings != null ? ` (${ev.days_to_earnings}d)` : ""}`
+              ? `${ev.next_earnings_date}${
+                  ev.days_to_earnings != null
+                    ? ev.days_to_earnings < 0
+                      ? ` (Reported ${Math.abs(ev.days_to_earnings)}d ago)`
+                      : ev.days_to_earnings === 0
+                      ? " (Today)"
+                      : ` (${ev.days_to_earnings}d)`
+                    : ""
+                }`
               : "N/A"}
           </div>
         </div>

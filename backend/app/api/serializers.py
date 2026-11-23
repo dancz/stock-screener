@@ -27,8 +27,8 @@ def get_watchlist_membership_map(session: Session) -> dict[str, list[int]]:
     return mapping
 
 
-def _normalize_trade_plan(raw_plan: dict[str, Any]) -> dict[str, Any]:
-    """Ensure legacy TradePlan snapshots include computed v2 gain/loss & index fields."""
+def _normalize_trade_plan(raw_plan: dict[str, Any], spot_price: float | None = None) -> dict[str, Any]:
+    """Ensure legacy TradePlan snapshots include computed v2/v3 gain, loss, spot R:R & ATR fields."""
     if not raw_plan or "entry_low" not in raw_plan:
         return {}
     plan = dict(raw_plan)
@@ -38,6 +38,8 @@ def _normalize_trade_plan(raw_plan: dict[str, Any]) -> dict[str, Any]:
     stop_loss = float(plan.get("stop_loss") or 0.0)
     tp1 = float(plan.get("tp1") or 0.0)
     tp2 = float(plan.get("tp2") or 0.0)
+    atr = float(plan.get("atr") or 0.0)
+    direction = str(plan.get("direction") or "NEUTRAL")
 
     if mid > 0:
         if plan.get("potential_gain_pct") is None:
@@ -46,11 +48,34 @@ def _normalize_trade_plan(raw_plan: dict[str, Any]) -> dict[str, Any]:
             plan["tp1_gain_pct"] = round(abs(tp1 - mid) / mid * 100.0, 2)
         if plan.get("potential_loss_pct") is None:
             plan["potential_loss_pct"] = round(abs(mid - stop_loss) / mid * 100.0, 2)
+        if plan.get("tp1_risk_reward") is None:
+            mid_risk = abs(mid - stop_loss)
+            plan["tp1_risk_reward"] = round(abs(tp1 - mid) / mid_risk, 2) if mid_risk > 0 else 0.0
     else:
         plan.setdefault("potential_gain_pct", 0.0)
         plan.setdefault("tp1_gain_pct", 0.0)
         plan.setdefault("potential_loss_pct", 0.0)
+        plan.setdefault("tp1_risk_reward", 0.0)
 
+    if spot_price and spot_price > 0 and stop_loss > 0:
+        spot_risk = (stop_loss - spot_price) if direction == "SHORT" else (spot_price - stop_loss)
+        if spot_risk > 0:
+            r1 = max(0.0, (spot_price - tp1) if direction == "SHORT" else (tp1 - spot_price))
+            r2 = max(0.0, (spot_price - tp2) if direction == "SHORT" else (tp2 - spot_price))
+            if plan.get("spot_risk_pct") is None:
+                plan["spot_risk_pct"] = round((spot_risk / spot_price) * 100.0, 2)
+            if plan.get("spot_rr_tp1") is None:
+                plan["spot_rr_tp1"] = round(r1 / spot_risk, 2)
+            if plan.get("spot_rr_tp2") is None:
+                plan["spot_rr_tp2"] = round(r2 / spot_risk, 2)
+            if plan.get("stop_distance_atr") is None and atr > 0:
+                plan["stop_distance_atr"] = round(spot_risk / atr, 2)
+
+    plan.setdefault("spot_risk_pct", None)
+    plan.setdefault("spot_rr_tp1", None)
+    plan.setdefault("spot_rr_tp2", None)
+    plan.setdefault("stop_distance_atr", None)
+    plan.setdefault("target_crosses_barrier", False)
     plan.setdefault("index_aligned", False)
     plan.setdefault("index_trend", "neutral")
     plan.setdefault("dist_to_support_pct", None)
@@ -68,7 +93,7 @@ def serialize_snapshot_summary(
     signals = json.loads(snap.signals_json or "[]")
     risk_flags = json.loads(snap.risk_flags_json or "[]")
     events_insiders = json.loads(snap.events_insiders_json or "{}")
-    trade_plan = _normalize_trade_plan(json.loads(snap.trade_plan_json or "{}"))
+    trade_plan = _normalize_trade_plan(json.loads(snap.trade_plan_json or "{}"), spot_price=snap.last_price)
 
     score = float(preset_scores.get(preset_id, snap.composite_score))
     return {
@@ -129,7 +154,7 @@ def serialize_snapshot_detail(
         "signals": json.loads(snap.signals_json or "[]"),
         "risk_flags": json.loads(snap.risk_flags_json or "[]"),
         "overlays": json.loads(snap.overlays_json or "[]"),
-        "trade_plan": _normalize_trade_plan(json.loads(snap.trade_plan_json or "{}")),
+        "trade_plan": _normalize_trade_plan(json.loads(snap.trade_plan_json or "{}"), spot_price=snap.last_price),
         "options": json.loads(snap.option_proposals_json or "{}"),
         "fundamentals": json.loads(snap.fundamentals_json or "{}"),
         "events_insiders": json.loads(snap.events_insiders_json or "{}"),

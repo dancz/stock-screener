@@ -47,6 +47,7 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
   const tp1 = Number(idea.tp1 ?? 0);
   const tp2 = Number(idea.tp2 ?? 0);
   const rr = Number(idea.risk_reward ?? 0);
+  const tp1Rr = Number(idea.tp1_risk_reward ?? 0);
   const lastPrice = Number(idea.last_price ?? 0);
   const changePct = Number(idea.change_pct ?? 0);
   const tp1GainPct = Number(idea.tp1_gain_pct ?? 0);
@@ -57,7 +58,11 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
   const estShares = riskDollars > 0 ? Math.max(0, Math.floor(riskDollars / riskPerShare)) : 0;
   const estPosValue = estShares * midEntry;
 
-  const accentBorder = isLong ? "border-emerald-500/30 hover:border-emerald-500/60" : "border-rose-500/30 hover:border-rose-500/60";
+  const accentBorder = idea.has_conflict
+    ? "border-amber-500/40 hover:border-amber-500/70"
+    : isLong
+    ? "border-emerald-500/30 hover:border-emerald-500/60"
+    : "border-rose-500/30 hover:border-rose-500/60";
   const badgeStyle = isLong
     ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
     : "border-rose-500/40 bg-rose-500/15 text-rose-300";
@@ -68,6 +73,10 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
       : idea.conviction_score >= 72
       ? "border-sky-500/40 bg-sky-500/15 text-sky-300"
       : "border-amber-500/40 bg-amber-500/15 text-amber-300";
+
+  const snapshotTooltip = idea.analyzed_at
+    ? `Snapshot close at ${new Date(idea.analyzed_at).toLocaleString()}`
+    : "Latest stored snapshot";
 
   return (
     <article className={`flex flex-col gap-3 rounded-xl border bg-panel p-4 transition-colors ${accentBorder}`}>
@@ -90,6 +99,11 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
             <span className="truncate text-xs text-slate-300">{idea.name}</span>
             {idea.sector && (
               <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-slate-400">{idea.sector}</span>
+            )}
+            {idea.has_conflict && (
+              <span className="rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                Conflicted Setup
+              </span>
             )}
           </div>
 
@@ -125,7 +139,11 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
                     : "border-border bg-card text-slate-400"
                 }`}
               >
-                Earnings in {idea.days_to_earnings}d
+                {idea.days_to_earnings < 0
+                  ? `Reported ${Math.abs(idea.days_to_earnings)}d ago`
+                  : idea.days_to_earnings === 0
+                  ? "Earnings Today"
+                  : `Earnings in ${idea.days_to_earnings}d`}
               </span>
             )}
 
@@ -137,7 +155,7 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
           </div>
         </div>
 
-        <div className="flex shrink-0 items-center gap-2.5 text-right">
+        <div className="flex shrink-0 items-center gap-2.5 text-right" title={snapshotTooltip}>
           <div>
             <div className="tabular-nums text-sm font-bold text-white">${lastPrice.toFixed(2)}</div>
             <div
@@ -146,7 +164,7 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
               }`}
             >
               {changePct >= 0 ? "+" : ""}
-              {changePct.toFixed(2)}%
+              {changePct.toFixed(2)}% <span className="text-[10px] font-normal text-slate-400">(1D)</span>
             </div>
           </div>
           <div className={`rounded-lg border px-2.5 py-1 text-center ${convictionColor}`}>
@@ -181,14 +199,17 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
         <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2">
           <div className="text-[10px] uppercase tracking-wider text-rose-300/80">Stop-Loss</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-rose-300">${stopLoss.toFixed(2)}</div>
-          <div className="mt-0.5 tabular-nums text-[10px] font-medium text-rose-400">-{lossPct.toFixed(1)}% Risk</div>
+          <div className="mt-0.5 tabular-nums text-[10px] font-medium text-rose-400">
+            -{lossPct.toFixed(1)}% Entry
+            {idea.stop_distance_atr != null ? ` • ${Number(idea.stop_distance_atr).toFixed(1)}x ATR` : ""}
+          </div>
         </div>
 
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2">
           <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 1</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">${tp1.toFixed(2)}</div>
           <div className="mt-0.5 tabular-nums text-[10px] font-medium text-emerald-400">
-            +{tp1GainPct.toFixed(1)}% Gain
+            +{tp1GainPct.toFixed(1)}% {tp1Rr > 0 ? `(${tp1Rr.toFixed(2)}R)` : ""}
           </div>
         </div>
 
@@ -196,13 +217,19 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
           <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 2</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">${tp2.toFixed(2)}</div>
           <div className="mt-0.5 tabular-nums text-[10px] font-medium text-emerald-400">
-            +{tp2GainPct.toFixed(1)}% Gain
+            +{tp2GainPct.toFixed(1)}% ({rr.toFixed(2)}R)
           </div>
         </div>
 
         <div className="col-span-2 rounded-lg border border-border/70 bg-canvas p-2 sm:col-span-1">
           <div className="text-[10px] uppercase tracking-wider text-slate-400">R:R / Size</div>
-          <div className="mt-0.5 tabular-nums text-xs font-bold text-white">{rr.toFixed(2)}x R:R</div>
+          <div className="mt-0.5 tabular-nums text-xs font-bold text-white">{rr.toFixed(2)}x Entry</div>
+          {idea.spot_rr_tp2 != null && (
+            <div className="mt-0.5 tabular-nums text-[10px] text-slate-300">
+              At Spot: {Number(idea.spot_rr_tp2).toFixed(2)}x (TP1{" "}
+              {idea.spot_rr_tp1 != null ? Number(idea.spot_rr_tp1).toFixed(2) : "—"}x)
+            </div>
+          )}
           <div className="mt-0.5 tabular-nums text-[10px] text-slate-400">
             {estShares > 0
               ? `~${estShares} sh ($${estPosValue.toLocaleString(undefined, { maximumFractionDigits: 0 })})`
@@ -228,8 +255,14 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
                 {r.category}
               </span>
               <span className="min-w-0">
-                <span className="font-semibold text-white">{r.title}: </span>
-                <span className="text-slate-300">{r.detail}</span>
+                {r.detail && r.detail !== r.title ? (
+                  <>
+                    <span className="font-semibold text-white">{r.title}: </span>
+                    <span className="text-slate-300">{r.detail}</span>
+                  </>
+                ) : (
+                  <span className="font-semibold text-white">{r.title}</span>
+                )}
               </span>
             </li>
           ))}
@@ -251,7 +284,7 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
         </div>
       )}
 
-      {/* Optional Matching Option Strategy */}
+      {/* Optional Matching Option Strategy with Strikes & Breakeven */}
       {idea.top_option && (
         <div className="rounded-lg border border-border/80 bg-canvas/80 px-3 py-2 text-[11px]">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -261,9 +294,32 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
             </span>
             <span className="tabular-nums text-slate-400">
               {idea.top_option.expiry} ({idea.top_option.dte} DTE) • IV {idea.top_option.iv_regime.toUpperCase()}
-              {idea.top_option.pop_estimate != null && ` • PoP ~${Math.round(idea.top_option.pop_estimate * 100)}%`}
+              {idea.top_option.pop_estimate != null && ` • PoP ~${Math.round(idea.top_option.pop_estimate)}%`}
             </span>
           </div>
+
+          {idea.top_option.legs && idea.top_option.legs.length > 0 && (
+            <div className="mt-1 flex flex-wrap items-center gap-1.5 tabular-nums">
+              {idea.top_option.legs.map((leg, lIdx) => (
+                <span
+                  key={lIdx}
+                  className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                    leg.action === "BUY"
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                      : "border-rose-500/30 bg-rose-500/10 text-rose-300"
+                  }`}
+                >
+                  {leg.action} ${leg.strike} {leg.option_type} (@ ${leg.mid_price.toFixed(2)})
+                </span>
+              ))}
+              {idea.top_option.breakeven && idea.top_option.breakeven.length > 0 && (
+                <span className="text-[10px] font-medium text-slate-300">
+                  • BE: ${idea.top_option.breakeven.map((b) => b.toFixed(2)).join(" / $")}
+                </span>
+              )}
+            </div>
+          )}
+
           <div className="mt-1 flex flex-wrap gap-3 text-slate-300 tabular-nums">
             <span>
               {idea.top_option.net_credit_debit >= 0 ? "Net Credit" : "Net Debit"}: $
@@ -302,6 +358,7 @@ export const TradeIdeasView: React.FC = () => {
   const excludeEarnings7d = useScreenerStore((s) => s.ideaExcludeEarnings7d);
   const indexAlignedOnly = useScreenerStore((s) => s.ideaIndexAlignedOnly);
   const watchlistOnly = useScreenerStore((s) => s.ideaWatchlistOnly);
+  const hideConflicted = useScreenerStore((s) => s.ideaHideConflicted);
   const settings = useScreenerStore((s) => s.settings);
   const setIdeaFilters = useScreenerStore((s) => s.setIdeaFilters);
   const fetchTradeIdeas = useScreenerStore((s) => s.fetchTradeIdeas);
@@ -315,6 +372,7 @@ export const TradeIdeasView: React.FC = () => {
   const buys = tradeIdeas?.buys ?? [];
   const sells = tradeIdeas?.sells ?? [];
   const totalScanned = tradeIdeas?.total_scanned ?? 0;
+  const filteredConflicted = tradeIdeas?.filtered_conflicted_count ?? 0;
   const regime = tradeIdeas?.market_regime;
 
   const regimeGuidance =
@@ -371,7 +429,7 @@ export const TradeIdeasView: React.FC = () => {
       <section className="rounded-xl border border-sky-500/30 bg-gradient-to-r from-sky-500/10 via-panel to-panel p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="space-y-1">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Lightbulb className="h-4 w-4 text-sky-400" />
               <h1 className="text-base font-bold text-white">Actionable Trade Ideas — Best Buys &amp; Sells</h1>
               <span className="rounded-full border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
@@ -473,6 +531,19 @@ export const TradeIdeasView: React.FC = () => {
 
         {/* Toggle Filters & Refresh */}
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setIdeaFilters({ hideConflicted: !hideConflicted })}
+            title="Filter out setups with high-severity conflicting signals, targets crossing major barriers, or >=12% 1D gap shocks"
+            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
+              hideConflicted
+                ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+                : "border-amber-500/50 bg-amber-500/15 text-amber-300"
+            }`}
+          >
+            Hide Conflicted{hideConflicted && filteredConflicted > 0 ? ` (${filteredConflicted})` : ""}
+          </button>
+
           <button
             type="button"
             onClick={() => setIdeaFilters({ excludeEarnings7d: !excludeEarnings7d })}

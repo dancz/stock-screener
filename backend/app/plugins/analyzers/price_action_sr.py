@@ -82,12 +82,14 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
         for idx in lo_idx:
             pivots.append({"price": float(lows[idx]), "idx": int(idx), "kind": "sup", "vol_mult": float(vols[idx] / avg_vol)})
 
-        # Cluster pivots into S/R zones within 0.75 * ATR
-        tol = max(0.75 * atr, last_close * 0.012)
+        # Cluster pivots against anchor price (prevents wide chain-drift across >5% spans)
+        tol = max(last_close * 0.008, min(0.65 * atr, last_close * 0.03))
+        pad = min(0.15 * atr, last_close * 0.008)
+        max_half_width = max(last_close * 0.008, min(0.5 * atr, last_close * 0.025))
         pivots.sort(key=lambda p: p["price"])
         clusters: list[list[dict[str, Any]]] = []
         for p in pivots:
-            if not clusters or (p["price"] - np.mean([x["price"] for x in clusters[-1]])) > tol:
+            if not clusters or (p["price"] - clusters[-1][0]["price"]) > tol:
                 clusters.append([p])
             else:
                 clusters[-1].append(p)
@@ -97,8 +99,10 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
         for grp in clusters:
             prices = [g["price"] for g in grp]
             mid = float(np.mean(prices))
-            low_b = min(prices) - 0.18 * atr
-            high_b = max(prices) + 0.18 * atr
+            low_b = max(0.01, max(min(prices) - pad, mid - max_half_width))
+            high_b = min(max(prices) + pad, mid + max_half_width)
+            if high_b < low_b:
+                low_b, high_b = min(low_b, high_b), max(low_b, high_b)
 
             # Count historical bar touches near the zone
             touch_mask = (lows <= high_b + 0.2 * atr) & (highs >= low_b - 0.2 * atr)
@@ -133,8 +137,18 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
         nearest_sup = top_supports[0] if top_supports else None
         nearest_res = top_resistances[0] if top_resistances else None
 
-        dist_sup_atr = ((last_close - nearest_sup["mid"]) / atr) if nearest_sup else 99.0
-        dist_res_atr = ((nearest_res["mid"] - last_close) / atr) if nearest_res else 99.0
+        inside_sup = bool(nearest_sup and nearest_sup["low"] <= last_close <= nearest_sup["high"])
+        inside_res = bool(nearest_res and nearest_res["low"] <= last_close <= nearest_res["high"])
+
+        if nearest_sup:
+            dist_sup_atr = 0.0 if inside_sup else max(0.0, (last_close - nearest_sup["high"]) / atr)
+        else:
+            dist_sup_atr = 99.0
+
+        if nearest_res:
+            dist_res_atr = 0.0 if inside_res else max(0.0, (nearest_res["low"] - last_close) / atr)
+        else:
+            dist_res_atr = 99.0
 
         # 2. Candlestick & Price Action Triggers on last 2 bars
         signals: list[Signal] = []
@@ -167,24 +181,34 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
         bullish_pts = 0.0
         bearish_pts = 0.0
 
-        # Proximity to support/resistance
-        if nearest_sup and dist_sup_atr <= 1.1:
-            pts = 16.0 if dist_sup_atr <= 0.6 else 10.0
+        # Proximity to support/resistance (edge-aware & inside-zone exact)
+        if nearest_sup and dist_sup_atr <= 0.9:
+            pts = 16.0 if dist_sup_atr <= 0.45 else 10.0
             bullish_pts += pts
+            sup_detail = (
+                f"Price (${last_close:.2f}) is inside support zone (${nearest_sup['low']:.2f}-${nearest_sup['high']:.2f}, mid ${nearest_sup['mid']:.2f})."
+                if inside_sup
+                else f"Price is {dist_sup_atr:.2f} ATR above support zone (${nearest_sup['low']:.2f}-${nearest_sup['high']:.2f}, mid ${nearest_sup['mid']:.2f})."
+            )
             signals.append(
                 Signal(
                     code="AT_SUPPORT_ZONE",
                     label=f"Testing Support ${nearest_sup['mid']:.2f}",
                     direction="bullish",
-                    severity="high" if dist_sup_atr <= 0.6 else "medium",
+                    severity="high" if dist_sup_atr <= 0.45 else "medium",
                     score_impact=pts,
-                    detail=f"Price is {dist_sup_atr:.2f} ATR above support zone (${nearest_sup['low']:.2f}-${nearest_sup['high']:.2f}).",
+                    detail=sup_detail,
                 )
             )
 
-        if nearest_res and dist_res_atr <= 0.75:
+        if nearest_res and dist_res_atr <= 0.55:
             pts = 10.0
             bearish_pts += pts
+            res_detail = (
+                f"Price (${last_close:.2f}) is inside resistance zone (${nearest_res['low']:.2f}-${nearest_res['high']:.2f}, mid ${nearest_res['mid']:.2f})."
+                if inside_res
+                else f"Price is {dist_res_atr:.2f} ATR below resistance zone (${nearest_res['low']:.2f}-${nearest_res['high']:.2f}, mid ${nearest_res['mid']:.2f})."
+            )
             signals.append(
                 Signal(
                     code="AT_RESISTANCE_ZONE",
@@ -192,7 +216,7 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
                     direction="bearish",
                     severity="medium",
                     score_impact=pts,
-                    detail=f"Price is {dist_res_atr:.2f} ATR below resistance zone (${nearest_res['low']:.2f}-${nearest_res['high']:.2f}).",
+                    detail=res_detail,
                 )
             )
 
@@ -382,6 +406,10 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
         hints = TradeHints(
             nearest_support=nearest_sup["mid"] if nearest_sup else None,
             nearest_resistance=nearest_res["mid"] if nearest_res else None,
+            support_zone_low=nearest_sup["low"] if nearest_sup else None,
+            support_zone_high=nearest_sup["high"] if nearest_sup else None,
+            resistance_zone_low=nearest_res["low"] if nearest_res else None,
+            resistance_zone_high=nearest_res["high"] if nearest_res else None,
             atr=round(atr, 4),
             setup_name=signals[0].label if signals else None,
             bias=bias,

@@ -66,6 +66,7 @@ export const api = {
     excludeEarningsDays?: number | null;
     indexAlignedOnly?: boolean;
     watchlistOnly?: boolean;
+    hideConflicted?: boolean;
   }): Promise<TradeIdeasResponse> {
     const qs = new URLSearchParams();
     if (params?.limit) qs.set("limit", String(params.limit));
@@ -76,6 +77,9 @@ export const api = {
     }
     if (params?.indexAlignedOnly) qs.set("index_aligned_only", "true");
     if (params?.watchlistOnly) qs.set("watchlist_only", "true");
+    if (params?.hideConflicted !== undefined) {
+      qs.set("hide_conflicted", params.hideConflicted ? "true" : "false");
+    }
     const suffix = qs.toString();
     return request<TradeIdeasResponse>(suffix ? `/api/trade-ideas?${suffix}` : "/api/trade-ideas");
   },
