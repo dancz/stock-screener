@@ -32,67 +32,92 @@ settings = Settings()
 DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
     "all_around_swing": {
         "name": "All-Around Swing",
-        "description": "Balanced swing setup across Price Action, Channels, RS, Volume, Fundamentals, Events & Insiders.",
+        "description": "Balanced swing setup across Price Action, Smart Money Zones, Channels, R:R, RS, Volume, Fundamentals, Events & Insiders.",
         "weights": {
-            "price_action_sr": 0.22,
-            "trend_channels": 0.22,
-            "correlation_rs": 0.16,
-            "volume_volatility": 0.16,
-            "fundamental_health": 0.12,
-            "events_earnings": 0.06,
-            "insider_activity": 0.06,
+            "price_action_sr": 0.16,
+            "smart_money_zones": 0.16,
+            "rr_index_trend": 0.14,
+            "trend_channels": 0.16,
+            "correlation_rs": 0.12,
+            "volume_volatility": 0.10,
+            "fundamental_health": 0.08,
+            "events_earnings": 0.04,
+            "insider_activity": 0.04,
+        },
+    },
+    "short_term_high_rr": {
+        "name": "Short-Term High R:R (Long/Short)",
+        "description": "Targets asymmetric Reward/Risk setups (Long or Short) near S/R & SMC zones aligned with the benchmark index trend.",
+        "weights": {
+            "rr_index_trend": 0.30,
+            "smart_money_zones": 0.24,
+            "price_action_sr": 0.16,
+            "trend_channels": 0.14,
+            "correlation_rs": 0.10,
+            "volume_volatility": 0.06,
+        },
+    },
+    "medium_term_invest": {
+        "name": "Medium-Term Investing",
+        "description": "Focuses on financial health, relative strength leadership, multi-month channels, SMC discount zones, and insider conviction.",
+        "weights": {
+            "fundamental_health": 0.34,
+            "correlation_rs": 0.18,
+            "trend_channels": 0.16,
+            "smart_money_zones": 0.14,
+            "insider_activity": 0.10,
+            "events_earnings": 0.08,
         },
     },
     "channel_bounce": {
         "name": "Channel Bounce",
-        "description": "Prioritizes stocks touching trend channel rails near S/R zones with Price Action confirmation.",
+        "description": "Prioritizes stocks touching trend channel rails near S/R & SMC zones with Price Action confirmation.",
         "weights": {
-            "trend_channels": 0.35,
-            "price_action_sr": 0.28,
-            "volume_volatility": 0.14,
-            "correlation_rs": 0.10,
-            "fundamental_health": 0.08,
-            "events_earnings": 0.03,
-            "insider_activity": 0.02,
+            "trend_channels": 0.32,
+            "price_action_sr": 0.24,
+            "smart_money_zones": 0.16,
+            "rr_index_trend": 0.10,
+            "volume_volatility": 0.08,
+            "correlation_rs": 0.06,
+            "fundamental_health": 0.04,
         },
     },
     "breakout_momentum": {
         "name": "Breakout & Momentum",
-        "description": "Focuses on TTM Squeeze releases, RVOL spikes, S/R or channel breakouts, and Relative Strength leaders.",
+        "description": "Focuses on TTM Squeeze releases, RVOL spikes, S/R or BOS breakouts, and Relative Strength leaders.",
         "weights": {
-            "volume_volatility": 0.28,
-            "correlation_rs": 0.24,
-            "price_action_sr": 0.22,
-            "trend_channels": 0.16,
-            "events_earnings": 0.05,
-            "fundamental_health": 0.03,
-            "insider_activity": 0.02,
+            "volume_volatility": 0.24,
+            "correlation_rs": 0.22,
+            "price_action_sr": 0.18,
+            "smart_money_zones": 0.16,
+            "trend_channels": 0.12,
+            "rr_index_trend": 0.05,
+            "events_earnings": 0.03,
         },
     },
     "options_income": {
         "name": "Options Income (High IV)",
         "description": "Highlights stable S/R & channel plays with healthy fundamentals and clean earnings runway for spreads.",
         "weights": {
-            "price_action_sr": 0.24,
-            "trend_channels": 0.24,
-            "fundamental_health": 0.22,
+            "price_action_sr": 0.20,
+            "trend_channels": 0.20,
+            "smart_money_zones": 0.16,
+            "fundamental_health": 0.20,
             "events_earnings": 0.14,
-            "volume_volatility": 0.10,
+            "volume_volatility": 0.06,
             "correlation_rs": 0.04,
-            "insider_activity": 0.02,
         },
     },
     "insider_quality": {
         "name": "Insider & Quality",
         "description": "Combines C-suite / cluster insider buys with strong financial health and technical support.",
         "weights": {
-            "insider_activity": 0.32,
-            "fundamental_health": 0.28,
-            "price_action_sr": 0.16,
-            "trend_channels": 0.12,
+            "insider_activity": 0.30,
+            "fundamental_health": 0.26,
+            "price_action_sr": 0.14,
+            "smart_money_zones": 0.14,
+            "trend_channels": 0.10,
             "correlation_rs": 0.06,
-            "volume_volatility": 0.04,
-            "events_earnings": 0.02,
         },
     },
 }
@@ -104,6 +129,8 @@ def get_default_runtime_settings() -> dict[str, Any]:
             "presets": DEFAULT_PRESETS,
             "enabled_plugins": {
                 "price_action_sr": True,
+                "smart_money_zones": True,
+                "rr_index_trend": True,
                 "trend_channels": True,
                 "correlation_rs": True,
                 "volume_volatility": True,
@@ -126,6 +153,19 @@ def get_default_runtime_settings() -> dict[str, Any]:
                 "port": settings.ibkr_port,
                 "client_id": settings.ibkr_client_id,
             },
+            "history": {
+                "profile": "dev",  # "dev" | "production"
+                "dev_daily_period": "2y",
+                "dev_intraday_period": "120d",
+                "dev_weekly_period": "5y",
+                "prod_daily_period": "5y",
+                "prod_intraday_period": "365d",
+                "prod_weekly_period": "10y",
+                "backfill_enabled": False,
+                "backfill_interval_minutes": 15,
+                "backfill_batch_size": 5,
+                "prefer_ibkr_history": True,
+            },
             "data_sources": {
                 "finnhub_api_key": settings.finnhub_api_key,
                 "sec_user_agent": settings.sec_user_agent,
@@ -145,4 +185,21 @@ def get_default_runtime_settings() -> dict[str, Any]:
                 "min_alert_score": 78,
             },
         }
+    )
+
+
+def get_active_history_periods(runtime_settings: dict[str, Any]) -> tuple[str, str, str]:
+    """Return (daily_period, intraday_period, weekly_period) for active history profile."""
+    hist = runtime_settings.get("history", {})
+    profile = str(hist.get("profile", "dev")).lower()
+    if profile == "production":
+        return (
+            str(hist.get("prod_daily_period", "5y")),
+            str(hist.get("prod_intraday_period", "365d")),
+            str(hist.get("prod_weekly_period", "10y")),
+        )
+    return (
+        str(hist.get("dev_daily_period", "2y")),
+        str(hist.get("dev_intraday_period", "120d")),
+        str(hist.get("dev_weekly_period", "5y")),
     )

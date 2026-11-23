@@ -13,7 +13,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.config import get_default_runtime_settings
@@ -36,6 +38,7 @@ class Ticker(Base):
     discovery_sources_json: Mapped[str] = mapped_column(Text, default="[]")
     is_custom: Mapped[bool] = mapped_column(Boolean, default=False)
     last_enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    history_backfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     candles: Mapped[list["Candle"]] = relationship(back_populates="ticker", cascade="all, delete-orphan")
     snapshots: Mapped[list["AnalysisSnapshot"]] = relationship(back_populates="ticker", cascade="all, delete-orphan")
@@ -104,6 +107,7 @@ class Watchlist(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
     color: Mapped[str] = mapped_column(String(24), default="#10b981")
+    horizon: Mapped[str] = mapped_column(String(24), default="general")  # short_term | medium_term | general
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -137,9 +141,19 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+def _ensure_column(engine: Engine, table_name: str, column_name: str, ddl_type: str) -> None:
+    """Idempotently add missing columns to existing SQLite databases."""
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()}
+        if column_name not in cols:
+            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}"))
+
+
 def init_db(db_session: Session | None = None) -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
+    _ensure_column(engine, "tickers", "history_backfilled_at", "DATETIME")
+    _ensure_column(engine, "watchlists", "horizon", "VARCHAR(24) DEFAULT 'general'")
 
     from app.db.database import SessionLocal
 
@@ -152,18 +166,21 @@ def init_db(db_session: Session | None = None) -> None:
             if key not in existing_keys:
                 session.add(AppSetting(key=key, value_json=json.dumps(value)))
 
-        # Seed one starter watchlist if none exist
+        # Seed starter watchlists (short-term, medium-term, general) if none exist
         if session.query(Watchlist).count() == 0:
-            starter = Watchlist(name="Core Swing", color="#10b981", sort_order=0)
-            session.add(starter)
-            session.flush()
-            for sym, name, sector, etf, bench in [
-                ("AAPL", "Apple Inc.", "Information Technology", "XLK", "QQQ"),
-                ("NVDA", "NVIDIA Corp.", "Information Technology", "XLK", "QQQ"),
-                ("MSFT", "Microsoft Corp.", "Information Technology", "XLK", "QQQ"),
-                ("META", "Meta Platforms Inc.", "Communication Services", "XLC", "QQQ"),
-                ("JPM", "JPMorgan Chase & Co.", "Financials", "XLF", "SPY"),
-            ]:
+            starter_lists = [
+                ("Short-Term Trades", "#f59e0b", "short_term", 0, ["NVDA", "META", "AAPL"]),
+                ("Medium-Term Investing", "#38bdf8", "medium_term", 1, ["MSFT", "AAPL", "JPM"]),
+                ("Core Swing", "#10b981", "general", 2, ["AAPL", "NVDA", "MSFT", "META", "JPM"]),
+            ]
+            seed_meta = {
+                "AAPL": ("Apple Inc.", "Information Technology", "XLK", "QQQ"),
+                "NVDA": ("NVIDIA Corp.", "Information Technology", "XLK", "QQQ"),
+                "MSFT": ("Microsoft Corp.", "Information Technology", "XLK", "QQQ"),
+                "META": ("Meta Platforms Inc.", "Communication Services", "XLC", "QQQ"),
+                "JPM": ("JPMorgan Chase & Co.", "Financials", "XLF", "SPY"),
+            }
+            for sym, (name, sector, etf, bench) in seed_meta.items():
                 if session.get(Ticker, sym) is None:
                     session.add(
                         Ticker(
@@ -175,7 +192,13 @@ def init_db(db_session: Session | None = None) -> None:
                             discovery_sources_json=json.dumps(["watchlist"]),
                         )
                     )
-                session.add(WatchlistItem(watchlist_id=starter.id, symbol=sym))
+            session.flush()
+            for wl_name, wl_color, wl_horizon, wl_order, wl_syms in starter_lists:
+                wl = Watchlist(name=wl_name, color=wl_color, horizon=wl_horizon, sort_order=wl_order)
+                session.add(wl)
+                session.flush()
+                for sym in wl_syms:
+                    session.add(WatchlistItem(watchlist_id=wl.id, symbol=sym))
 
         session.commit()
     finally:

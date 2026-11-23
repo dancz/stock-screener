@@ -8,10 +8,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.serializers import serialize_snapshot_detail
+from app.config import get_active_history_periods
 from app.core.pipeline import enrich_single_ticker, load_candles_df, upsert_candles
 from app.db.database import get_db
-from app.db.models import AnalysisSnapshot, Ticker, TickerNote, utcnow
-from app.plugins.sources.market_data_yahoo import fetch_intraday_1h
+from app.db.models import AnalysisSnapshot, Ticker, TickerNote, load_runtime_settings, utcnow
+from app.plugins.sources.market_data_ibkr import fetch_live_quote_ibkr
+from app.plugins.sources.market_data_yahoo import (
+    fetch_intraday_1h,
+    fetch_live_quote,
+    fetch_weekly_bars,
+    resample_daily_to_weekly,
+)
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
 
@@ -19,6 +26,29 @@ router = APIRouter(prefix="/stocks", tags=["stocks"])
 class NoteUpdateBody(BaseModel):
     note_text: str = ""
     tags: list[str] = Field(default_factory=list)
+
+
+@router.get("/{symbol}/quote")
+def get_live_stock_quote(symbol: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    sym = symbol.strip().upper().replace(".", "-")
+    runtime = load_runtime_settings(db)
+    ibkr_cfg = runtime.get("ibkr", {})
+
+    quote: dict[str, Any] | None = None
+    if ibkr_cfg.get("enabled", False):
+        quote = fetch_live_quote_ibkr(
+            symbol=sym,
+            host=str(ibkr_cfg.get("host", "127.0.0.1")),
+            port=int(ibkr_cfg.get("port", 4002)),
+            client_id=int(ibkr_cfg.get("client_id", 17)),
+        )
+
+    if quote is None:
+        quote = fetch_live_quote(sym)
+
+    if quote is None:
+        raise HTTPException(status_code=404, detail=f"Live quote unavailable for {sym}.")
+    return quote
 
 
 @router.get("/{symbol}")
@@ -59,18 +89,34 @@ def get_stock_detail(
 @router.get("/{symbol}/candles")
 def get_stock_candles(
     symbol: str,
-    timeframe: str = Query(default="1d", pattern="^(1d|1h)$"),
+    timeframe: str = Query(default="1d", pattern="^(1w|1d|1h)$"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     sym = symbol.strip().upper().replace(".", "-")
+    runtime = load_runtime_settings(db)
+    _, intraday_period, weekly_period = get_active_history_periods(runtime)
+
     df = load_candles_df(db, sym, timeframe)
     if df.empty and timeframe == "1h":
-        fetched = fetch_intraday_1h(sym, period="60d")
+        fetched = fetch_intraday_1h(sym, period=intraday_period)
         if not fetched.empty:
             if db.get(Ticker, sym) is None:
                 db.add(Ticker(symbol=sym, name=sym, is_custom=True))
                 db.flush()
             upsert_candles(db, sym, "1h", fetched)
+            db.commit()
+            df = fetched
+    elif df.empty and timeframe == "1w":
+        fetched = fetch_weekly_bars(sym, period=weekly_period)
+        if fetched.empty:
+            daily_df = load_candles_df(db, sym, "1d")
+            if not daily_df.empty:
+                fetched = resample_daily_to_weekly(daily_df)
+        if not fetched.empty:
+            if db.get(Ticker, sym) is None:
+                db.add(Ticker(symbol=sym, name=sym, is_custom=True))
+                db.flush()
+            upsert_candles(db, sym, "1w", fetched)
             db.commit()
             df = fetched
 
@@ -85,7 +131,14 @@ def get_stock_candles(
         }
         for row in df.itertuples(index=False)
     ]
-    return {"symbol": sym, "timeframe": timeframe, "candles": candles}
+    return {
+        "symbol": sym,
+        "timeframe": timeframe,
+        "bar_count": len(candles),
+        "first_ts": candles[0]["time"] if candles else None,
+        "last_ts": candles[-1]["time"] if candles else None,
+        "candles": candles,
+    }
 
 
 @router.post("/{symbol}/refresh")

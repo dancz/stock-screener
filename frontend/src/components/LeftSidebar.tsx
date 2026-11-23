@@ -1,12 +1,22 @@
 import React, { useEffect, useState } from "react";
-import { AlertTriangle, Bookmark, Plus, Search, Trash2 } from "lucide-react";
+import { AlertTriangle, Bookmark, Compass, Plus, Search, Trash2 } from "lucide-react";
 import { useScreenerStore } from "../store/useScreenerStore";
+import type { SortBy, WatchlistHorizon } from "../types/screener";
 import { WatchlistPopover } from "./WatchlistPopover";
 
-const SIGNAL_CHIPS: Array<{ label: string; signal?: string; bias?: string; noEarn?: boolean }> = [
+const SIGNAL_CHIPS: Array<{
+  label: string;
+  signal?: string;
+  bias?: string;
+  noEarn?: boolean;
+  indexAligned?: boolean;
+}> = [
   { label: "All" },
+  { label: "SMC OB", signal: "SMC_AT_BULLISH_OB,SMC_AT_BEARISH_OB" },
+  { label: "High R:R", signal: "HIGH_ASYMMETRIC_RR_LONG,HIGH_ASYMMETRIC_RR_SHORT" },
+  { label: "Index Aligned", indexAligned: true },
   { label: "Lower Channel", signal: "LOWER_CHANNEL_TOUCH" },
-  { label: "Breakout", signal: "CHANNEL_BREAKOUT_UP,SR_BREAK_RETEST" },
+  { label: "Breakout", signal: "CHANNEL_BREAKOUT_UP,SR_BREAK_RETEST,SMC_BULLISH_BOS,SMC_BULLISH_CHOCH" },
   { label: "Squeeze", signal: "SQUEEZE_ON,SQUEEZE_FIRED" },
   { label: "Insider Buy", signal: "INSIDER_CLUSTER_BUY,CEO_CFO_BUY" },
   { label: "No Earn <7d", noEarn: true },
@@ -14,15 +24,24 @@ const SIGNAL_CHIPS: Array<{ label: string; signal?: string; bias?: string; noEar
   { label: "Short", bias: "bearish" },
 ];
 
+const HORIZON_BADGE: Record<WatchlistHorizon, { short: string; cls: string }> = {
+  short_term: { short: "ST", cls: "bg-amber-500/20 text-amber-300" },
+  medium_term: { short: "MT", cls: "bg-sky-500/20 text-sky-300" },
+  general: { short: "GEN", cls: "bg-emerald-500/20 text-emerald-300" },
+};
+
 export const LeftSidebar: React.FC = () => {
   const [newListName, setNewListName] = useState("");
+  const [newListHorizon, setNewListHorizon] = useState<WatchlistHorizon>("short_term");
   const [showNewList, setShowNewList] = useState(false);
 
   const sidebarTab = useScreenerStore((s) => s.sidebarTab);
   const setSidebarTab = useScreenerStore((s) => s.setSidebarTab);
   const activePreset = useScreenerStore((s) => s.activePreset);
+  const sortBy = useScreenerStore((s) => s.sortBy);
   const presets = useScreenerStore((s) => s.presets);
   const setActivePreset = useScreenerStore((s) => s.setActivePreset);
+  const setSortBy = useScreenerStore((s) => s.setSortBy);
   const watchlists = useScreenerStore((s) => s.watchlists);
   const activeWatchlistId = useScreenerStore((s) => s.activeWatchlistId);
   const setActiveWatchlistId = useScreenerStore((s) => s.setActiveWatchlistId);
@@ -32,10 +51,12 @@ export const LeftSidebar: React.FC = () => {
   const signalFilter = useScreenerStore((s) => s.signalFilter);
   const biasFilter = useScreenerStore((s) => s.biasFilter);
   const excludeEarnings7d = useScreenerStore((s) => s.excludeEarnings7d);
+  const indexAlignedOnly = useScreenerStore((s) => s.indexAlignedOnly);
   const searchFilter = useScreenerStore((s) => s.searchFilter);
   const setSignalFilter = useScreenerStore((s) => s.setSignalFilter);
   const setBiasFilter = useScreenerStore((s) => s.setBiasFilter);
   const setExcludeEarnings7d = useScreenerStore((s) => s.setExcludeEarnings7d);
+  const setIndexAlignedOnly = useScreenerStore((s) => s.setIndexAlignedOnly);
   const setSearchFilter = useScreenerStore((s) => s.setSearchFilter);
 
   const items = useScreenerStore((s) => s.items);
@@ -74,14 +95,19 @@ export const LeftSidebar: React.FC = () => {
   const handleCreateList = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newListName.trim()) return;
-    await createWatchlist(newListName.trim());
+    await createWatchlist(newListName.trim(), newListHorizon);
     setNewListName("");
     setShowNewList(false);
   };
 
   const applyChip = async (chip: (typeof SIGNAL_CHIPS)[number]) => {
-    if (!chip.signal && !chip.bias && !chip.noEarn) {
-      useScreenerStore.setState({ signalFilter: null, biasFilter: null, excludeEarnings7d: false });
+    if (!chip.signal && !chip.bias && !chip.noEarn && !chip.indexAligned) {
+      useScreenerStore.setState({
+        signalFilter: null,
+        biasFilter: null,
+        excludeEarnings7d: false,
+        indexAlignedOnly: false,
+      });
       await useScreenerStore.getState().fetchScreener();
       return;
     }
@@ -91,6 +117,8 @@ export const LeftSidebar: React.FC = () => {
       await setBiasFilter(biasFilter === chip.bias ? null : chip.bias);
     } else if (chip.noEarn) {
       await setExcludeEarnings7d(!excludeEarnings7d);
+    } else if (chip.indexAligned) {
+      await setIndexAlignedOnly(!indexAlignedOnly);
     }
   };
 
@@ -102,7 +130,7 @@ export const LeftSidebar: React.FC = () => {
   };
 
   return (
-    <aside className="flex w-[345px] shrink-0 flex-col border-r border-border bg-panel">
+    <aside className="flex w-[360px] shrink-0 flex-col border-r border-border bg-panel">
       {/* Mode Switch Tabs */}
       <div className="grid grid-cols-2 border-b border-border p-1.5 gap-1">
         <button
@@ -135,22 +163,26 @@ export const LeftSidebar: React.FC = () => {
         <div className="border-b border-border bg-canvas/50 p-2.5 space-y-2">
           <div className="flex items-center justify-between gap-1.5">
             <div className="flex flex-wrap gap-1 flex-1">
-              {watchlists.map((wl) => (
-                <button
-                  key={wl.id}
-                  type="button"
-                  onClick={() => setActiveWatchlistId(wl.id)}
-                  className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors ${
-                    activeWatchlistId === wl.id
-                      ? "border-sky-500/50 bg-sky-500/15 text-sky-200"
-                      : "border-border bg-card text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: wl.color }} />
-                  <span>{wl.name}</span>
-                  <span className="text-[10px] opacity-70">{wl.count}</span>
-                </button>
-              ))}
+              {watchlists.map((wl) => {
+                const badge = HORIZON_BADGE[wl.horizon || "general"] || HORIZON_BADGE.general;
+                return (
+                  <button
+                    key={wl.id}
+                    type="button"
+                    onClick={() => setActiveWatchlistId(wl.id)}
+                    className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors ${
+                      activeWatchlistId === wl.id
+                        ? "border-sky-500/50 bg-sky-500/15 text-sky-200"
+                        : "border-border bg-card text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: wl.color }} />
+                    <span>{wl.name}</span>
+                    <span className={`rounded px-1 text-[9px] font-bold ${badge.cls}`}>{badge.short}</span>
+                    <span className="text-[10px] opacity-70">{wl.count}</span>
+                  </button>
+                );
+              })}
             </div>
             <div className="flex items-center gap-1">
               <button
@@ -175,29 +207,40 @@ export const LeftSidebar: React.FC = () => {
           </div>
 
           {showNewList && (
-            <form onSubmit={handleCreateList} className="flex gap-1.5">
-              <input
-                type="text"
-                value={newListName}
-                onChange={(e) => setNewListName(e.target.value)}
-                placeholder="New watchlist name..."
-                autoFocus
-                className="flex-1 rounded border border-border bg-canvas px-2 py-1 text-xs text-slate-100 focus:border-sky-500 focus:outline-none"
-              />
-              <button
-                type="submit"
-                className="rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+            <form onSubmit={handleCreateList} className="space-y-1.5 rounded border border-border bg-panel p-2">
+              <div className="flex gap-1.5">
+                <input
+                  type="text"
+                  value={newListName}
+                  onChange={(e) => setNewListName(e.target.value)}
+                  placeholder="New watchlist name..."
+                  autoFocus
+                  className="flex-1 rounded border border-border bg-canvas px-2 py-1 text-xs text-slate-100 focus:border-sky-500 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  className="rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
+                >
+                  Create
+                </button>
+              </div>
+              <select
+                value={newListHorizon}
+                onChange={(e) => setNewListHorizon(e.target.value as WatchlistHorizon)}
+                className="w-full rounded border border-border bg-canvas px-2 py-1 text-[11px] text-slate-200 focus:border-sky-500 focus:outline-none"
               >
-                Create
-              </button>
+                <option value="short_term">Horizon: Short-Term Trades (High R:R Long/Short)</option>
+                <option value="medium_term">Horizon: Medium-Term Investing</option>
+                <option value="general">Horizon: General Watchlist</option>
+              </select>
             </form>
           )}
         </div>
       )}
 
-      {/* Preset & Search & Quick Filters */}
+      {/* Preset, Sort By, Search & Quick Filters */}
       <div className="space-y-2 border-b border-border p-2.5">
-        <div className="flex items-center gap-2">
+        <div className="grid grid-cols-1 gap-1.5">
           <select
             value={activePreset}
             onChange={(e) => setActivePreset(e.target.value)}
@@ -208,6 +251,17 @@ export const LeftSidebar: React.FC = () => {
                 Preset: {p.name}
               </option>
             ))}
+          </select>
+
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as SortBy)}
+            className="w-full rounded-md border border-border bg-canvas px-2.5 py-1.5 text-xs font-medium text-sky-200 focus:border-sky-500 focus:outline-none"
+          >
+            <option value="score">Sort: Preset Score (0–100)</option>
+            <option value="risk_reward">Sort: Best R:R &amp; Index Trend</option>
+            <option value="potential_gain">Sort: Max Potential Gain % (Long/Short)</option>
+            <option value="tight_entry">Sort: Tightest S/R Stop Risk</option>
           </select>
         </div>
 
@@ -225,10 +279,18 @@ export const LeftSidebar: React.FC = () => {
         <div className="flex flex-wrap gap-1">
           {SIGNAL_CHIPS.map((chip) => {
             const active =
-              (!chip.signal && !chip.bias && !chip.noEarn && !signalFilter && !biasFilter && !excludeEarnings7d) ||
+              (!chip.signal &&
+                !chip.bias &&
+                !chip.noEarn &&
+                !chip.indexAligned &&
+                !signalFilter &&
+                !biasFilter &&
+                !excludeEarnings7d &&
+                !indexAlignedOnly) ||
               (chip.signal && signalFilter === chip.signal) ||
               (chip.bias && biasFilter === chip.bias) ||
-              (chip.noEarn && excludeEarnings7d);
+              (chip.noEarn && excludeEarnings7d) ||
+              (chip.indexAligned && indexAlignedOnly);
             return (
               <button
                 key={chip.label}
@@ -278,15 +340,20 @@ export const LeftSidebar: React.FC = () => {
                     <span className="text-sm font-bold tracking-tight text-white">{item.symbol}</span>
                     <span
                       className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
-                        item.bias === "bullish"
+                        item.trade_direction === "LONG" || item.bias === "bullish"
                           ? "bg-emerald-500/15 text-emerald-400"
-                          : item.bias === "bearish"
+                          : item.trade_direction === "SHORT" || item.bias === "bearish"
                           ? "bg-rose-500/15 text-rose-400"
                           : "bg-slate-700/60 text-slate-300"
                       }`}
                     >
-                      {item.bias}
+                      {item.trade_direction !== "NEUTRAL" ? item.trade_direction : item.bias}
                     </span>
+                    {item.index_aligned && (
+                      <span title={`Aligned with ${item.primary_benchmark} trend`}>
+                        <Compass className="h-3.5 w-3.5 text-emerald-400" />
+                      </span>
+                    )}
                     {hasRisk && (
                       <span title={item.risk_flags.map((r) => r.label).join(", ")}>
                         <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
@@ -323,8 +390,17 @@ export const LeftSidebar: React.FC = () => {
                 </div>
               </div>
 
+              {/* Compact R:R & Potential Gain/Loss line */}
+              {item.risk_reward > 0 && (
+                <div className="mt-1 flex items-center gap-2 tabular-nums text-[10px] text-slate-400">
+                  <span className="font-semibold text-sky-300">R:R {item.risk_reward.toFixed(1)}x</span>
+                  <span className="text-emerald-400">+{item.potential_gain_pct.toFixed(1)}%</span>
+                  <span className="text-rose-400">-{item.potential_loss_pct.toFixed(1)}%</span>
+                </div>
+              )}
+
               {item.top_signals.length > 0 && (
-                <div className="mt-1.5 flex flex-wrap gap-1">
+                <div className="mt-1 flex flex-wrap gap-1">
                   {item.top_signals.slice(0, 2).map((sig) => (
                     <span
                       key={sig.code}

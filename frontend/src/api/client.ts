@@ -1,11 +1,15 @@
 import type {
+  BackfillStatus,
   CandleBar,
+  LiveQuote,
   PluginDescriptor,
   RuntimeSettings,
   ScanStatus,
   ScreenerResponse,
+  SortBy,
   StockDetail,
   Watchlist,
+  WatchlistHorizon,
 } from "../types/screener";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -29,14 +33,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   getScreener(params: {
     preset?: string;
+    sortBy?: SortBy;
     watchlistId?: number | null;
     signal?: string | null;
     bias?: string | null;
     excludeEarningsDays?: number | null;
+    indexAlignedOnly?: boolean;
     search?: string;
   }): Promise<ScreenerResponse> {
     const qs = new URLSearchParams();
     if (params.preset) qs.set("preset", params.preset);
+    if (params.sortBy) qs.set("sort_by", params.sortBy);
     if (params.watchlistId !== undefined && params.watchlistId !== null) {
       qs.set("watchlist_id", String(params.watchlistId));
     }
@@ -45,6 +52,7 @@ export const api = {
     if (params.excludeEarningsDays !== undefined && params.excludeEarningsDays !== null) {
       qs.set("exclude_earnings_days", String(params.excludeEarningsDays));
     }
+    if (params.indexAlignedOnly) qs.set("index_aligned_only", "true");
     if (params.search) qs.set("search", params.search);
     return request<ScreenerResponse>(`/api/screener?${qs.toString()}`);
   },
@@ -53,7 +61,14 @@ export const api = {
     return request<StockDetail>(`/api/stocks/${encodeURIComponent(symbol)}`);
   },
 
-  getCandles(symbol: string, timeframe: "1d" | "1h"): Promise<{ symbol: string; timeframe: string; candles: CandleBar[] }> {
+  getLiveQuote(symbol: string): Promise<LiveQuote> {
+    return request<LiveQuote>(`/api/stocks/${encodeURIComponent(symbol)}/quote`);
+  },
+
+  getCandles(
+    symbol: string,
+    timeframe: "1w" | "1d" | "1h"
+  ): Promise<{ symbol: string; timeframe: string; bar_count: number; candles: CandleBar[] }> {
     return request(`/api/stocks/${encodeURIComponent(symbol)}/candles?timeframe=${timeframe}`);
   },
 
@@ -72,10 +87,10 @@ export const api = {
     return request("/api/watchlists");
   },
 
-  createWatchlist(name: string, color = "#10b981"): Promise<Watchlist> {
+  createWatchlist(name: string, color = "#10b981", horizon: WatchlistHorizon = "general"): Promise<Watchlist> {
     return request("/api/watchlists", {
       method: "POST",
-      body: JSON.stringify({ name, color }),
+      body: JSON.stringify({ name, color, horizon }),
     });
   },
 
@@ -107,6 +122,14 @@ export const api = {
 
   getScanStatus(): Promise<ScanStatus> {
     return request("/api/scan/status");
+  },
+
+  getBackfillStatus(): Promise<BackfillStatus> {
+    return request("/api/scan/backfill/status");
+  },
+
+  triggerBackfill(): Promise<{ started: boolean; status: BackfillStatus }> {
+    return request("/api/scan/backfill", { method: "POST" });
   },
 
   getSettings(): Promise<{ settings: RuntimeSettings; plugins: PluginDescriptor[] }> {

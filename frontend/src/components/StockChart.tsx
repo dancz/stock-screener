@@ -29,16 +29,21 @@ function hexToRgba(hex: string, alpha: number): string {
 }
 
 class ZonesAndPlanPrimitive implements ISeriesPrimitive<Time> {
+  private _chart: IChartApi | null = null;
   private _series: ISeriesApi<SeriesType, Time> | null = null;
   private _requestUpdate?: () => void;
   private _overlays: ChartOverlay[] = [];
+  private _firstBarTs = 0;
+  private _lastBarTs = 0;
 
   private _paneView: ISeriesPrimitivePaneView = {
     zOrder: (): SeriesPrimitivePaneViewZOrder => "bottom",
     renderer: (): ISeriesPrimitivePaneRenderer => ({
       draw: (target) => {
-        if (!this._series || this._overlays.length === 0) return;
+        if (!this._series || !this._chart || this._overlays.length === 0) return;
         const series = this._series;
+        const timeScale = this._chart.timeScale();
+
         target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
           const width = mediaSize.width;
           ctx.save();
@@ -71,6 +76,35 @@ class ZonesAndPlanPrimitive implements ISeriesPrimitive<Time> {
                   ctx.fillStyle = "#fde047";
                   ctx.fillText(ov.label, 8, yMid - 4);
                 }
+              } else if (role === "ob_bull" || role === "ob_bear" || role === "fvg_bull" || role === "fvg_bear") {
+                const startTs = Number(ov.data.startTs || 0);
+                let x0 = 0;
+                if (startTs > 0 && this._lastBarTs > 0) {
+                  if (startTs > this._lastBarTs) continue;
+                  const coord = timeScale.timeToCoordinate(startTs as UTCTimestamp);
+                  if (coord !== null) {
+                    x0 = Math.max(0, Math.min(width - 20, coord));
+                  } else if (startTs > this._firstBarTs) {
+                    x0 = 0;
+                  }
+                }
+                const boxW = Math.max(12, width - x0);
+                const isFvg = role.startsWith("fvg");
+                ctx.fillStyle = hexToRgba(ov.color, isFvg ? 0.16 : 0.2);
+                ctx.fillRect(x0, top, boxW, h);
+                ctx.strokeStyle = hexToRgba(ov.color, isFvg ? 0.55 : 0.75);
+                ctx.lineWidth = 1;
+                ctx.setLineDash(isFvg ? [3, 3] : []);
+                ctx.strokeRect(x0, top, boxW, h);
+                ctx.setLineDash([]);
+
+                ctx.fillStyle = hexToRgba(ov.color, 0.95);
+                ctx.fillText(ov.label, x0 + 6, Math.max(11, top + 11));
+              } else if (role === "discount" || role === "premium") {
+                ctx.fillStyle = hexToRgba(ov.color, 0.06);
+                ctx.fillRect(0, top, width, h);
+                ctx.fillStyle = hexToRgba(ov.color, 0.65);
+                ctx.fillText(ov.label, width - 165, Math.max(11, top + 11));
               } else {
                 ctx.fillStyle = hexToRgba(ov.color, 0.12);
                 ctx.fillRect(0, top, width, h);
@@ -103,8 +137,7 @@ class ZonesAndPlanPrimitive implements ISeriesPrimitive<Time> {
               const yTp1 = series.priceToCoordinate(tp1);
               const yTp2 = series.priceToCoordinate(tp2);
 
-              // Right-half box so historical bars remain unobstructed
-              const xStart = width * 0.62;
+              const xStart = width * 0.65;
               const boxW = width - xStart;
 
               if (yMid !== null && yTp2 !== null) {
@@ -153,17 +186,21 @@ class ZonesAndPlanPrimitive implements ISeriesPrimitive<Time> {
   };
 
   attached(param: SeriesAttachedParameter<Time, SeriesType>): void {
+    this._chart = param.chart as IChartApi;
     this._series = param.series;
     this._requestUpdate = param.requestUpdate;
   }
 
   detached(): void {
+    this._chart = null;
     this._series = null;
     this._requestUpdate = undefined;
   }
 
-  setOverlays(overlays: ChartOverlay[]): void {
+  setOverlays(overlays: ChartOverlay[], firstBarTs: number, lastBarTs: number): void {
     this._overlays = overlays;
+    this._firstBarTs = firstBarTs;
+    this._lastBarTs = lastBarTs;
     this._requestUpdate?.();
   }
 
@@ -197,6 +234,7 @@ function computeEmaSeries(candles: CandleBar[], period: number): Array<{ time: T
 }
 
 const LAYER_META: Array<{ key: OverlayLayer; label: string; colorClass: string }> = [
+  { key: "smart_money", label: "SMC Zones", colorClass: "text-blue-300" },
   { key: "channels", label: "Channels", colorClass: "text-emerald-300" },
   { key: "sr_zones", label: "S/R Zones", colorClass: "text-sky-300" },
   { key: "price_action", label: "Price Action", colorClass: "text-emerald-300" },
@@ -241,7 +279,7 @@ export const StockChart: React.FC = () => {
       rightPriceScale: { borderColor: "#253047" },
       timeScale: { borderColor: "#253047", timeVisible: true, secondsVisible: false },
       width: el.clientWidth,
-      height: 430,
+      height: 440,
     });
 
     const candleSeries = chart.addCandlestickSeries({
@@ -297,7 +335,6 @@ export const StockChart: React.FC = () => {
     const primitive = primitiveRef.current;
     if (!chart || !candleSeries || !volumeSeries || !primitive) return;
 
-    // Clear previously drawn overlay LineSeries
     for (const s of extraSeriesRef.current) {
       try {
         chart.removeSeries(s);
@@ -311,9 +348,12 @@ export const StockChart: React.FC = () => {
       candleSeries.setData([]);
       volumeSeries.setData([]);
       candleSeries.setMarkers([]);
-      primitive.setOverlays([]);
+      primitive.setOverlays([], 0, 0);
       return;
     }
+
+    const firstT = candles[0].time;
+    const lastT = candles[candles.length - 1].time;
 
     candleSeries.setData(
       candles.map((c) => ({
@@ -341,14 +381,17 @@ export const StockChart: React.FC = () => {
 
     // 1. Primitive overlays (horizontal_zone & price_box)
     primitive.setOverlays(
-      activeOverlays.filter((ov) => ov.kind === "horizontal_zone" || ov.kind === "price_box")
+      activeOverlays.filter((ov) => ov.kind === "horizontal_zone" || ov.kind === "price_box"),
+      firstT,
+      lastT
     );
 
-    // 2. Price action markers
+    // 2. Price action & SMC markers
     const markers: SeriesMarker<Time>[] = [];
     for (const ov of activeOverlays) {
       if (ov.kind === "marker") {
         const rawTime = Number(ov.data.time);
+        if (rawTime < firstT || rawTime > lastT) continue;
         markers.push({
           time: snapTime(rawTime, candles),
           position: (ov.data.position as "aboveBar" | "belowBar") || "belowBar",
@@ -362,9 +405,6 @@ export const StockChart: React.FC = () => {
     candleSeries.setMarkers(markers);
 
     // 3. Trend channels & Line series
-    const firstT = candles[0].time;
-    const lastT = candles[candles.length - 1].time;
-
     for (const ov of activeOverlays) {
       if (ov.kind === "channel") {
         const sTs = Number(ov.data.startTs);
@@ -435,8 +475,8 @@ export const StockChart: React.FC = () => {
       }
     }
 
-    // On 1H timeframe, compute crisp local EMAs 20/50/200 when EMAs layer is enabled
-    if (timeframe === "1h" && layers.emas) {
+    // On 1H and 1W timeframes, compute crisp local EMAs 20/50/200 when EMAs layer is enabled
+    if (timeframe !== "1d" && layers.emas) {
       for (const [period, color] of [
         [20, "#38bdf8"],
         [50, "#f59e0b"],
@@ -457,12 +497,17 @@ export const StockChart: React.FC = () => {
     chart.timeScale().fitContent();
   }, [candles, detail, layers, timeframe]);
 
+  const spanYears =
+    candles.length >= 2
+      ? ((candles[candles.length - 1].time - candles[0].time) / (365.25 * 86400)).toFixed(1)
+      : null;
+
   return (
     <section className="rounded-xl border border-border bg-panel overflow-hidden">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-1.5">
-          {(["1d", "1h"] as const).map((tf) => (
+          {(["1w", "1d", "1h"] as const).map((tf) => (
             <button
               key={tf}
               type="button"
@@ -476,7 +521,12 @@ export const StockChart: React.FC = () => {
               {tf}
             </button>
           ))}
-          {loadingCandles && <span className="ml-2 text-[11px] text-slate-400">Loading candles...</span>}
+          {candles.length > 0 && (
+            <span className="ml-2 tabular-nums text-[11px] text-slate-400">
+              {candles.length} bars{spanYears ? ` (${spanYears}Y)` : ""}
+            </span>
+          )}
+          {loadingCandles && <span className="ml-2 text-[11px] text-sky-300">Loading candles...</span>}
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
@@ -501,7 +551,7 @@ export const StockChart: React.FC = () => {
       </div>
 
       {/* Chart Container */}
-      <div ref={containerRef} className="w-full" style={{ height: 430 }} />
+      <div ref={containerRef} className="w-full" style={{ height: 440 }} />
     </section>
   );
 };

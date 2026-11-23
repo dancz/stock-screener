@@ -32,10 +32,12 @@ def compute_scores_and_summary(
 
     # Bias aggregation weighted by structural importance & confidence
     bias_weight_map = {
-        "price_action_sr": 1.5,
-        "trend_channels": 1.6,
-        "volume_volatility": 1.2,
-        "correlation_rs": 1.1,
+        "price_action_sr": 1.4,
+        "smart_money_zones": 1.6,
+        "rr_index_trend": 1.4,
+        "trend_channels": 1.5,
+        "volume_volatility": 1.1,
+        "correlation_rs": 1.0,
         "fundamental_health": 0.7,
         "events_earnings": 0.4,
         "insider_activity": 0.7,

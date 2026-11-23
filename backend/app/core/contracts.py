@@ -44,6 +44,7 @@ class ChartOverlay(BaseModel):
     layer: Literal[
         "channels",
         "sr_zones",
+        "smart_money",
         "price_action",
         "trade_plan",
         "emas",
@@ -69,6 +70,9 @@ class TradeHints(BaseModel):
     channel_lower: float | None = None
     channel_upper: float | None = None
     channel_mid: float | None = None
+    smc_demand_zone: tuple[float, float] | None = None
+    smc_supply_zone: tuple[float, float] | None = None
+    swing_trend: Literal["bullish", "bearish", "neutral"] | None = None
     atr: float | None = None
     setup_name: str | None = None
     bias: Literal["bullish", "bearish", "neutral"] | None = None
@@ -133,6 +137,13 @@ class TradePlan(BaseModel):
     risk_reward: float
     atr: float
     risk_per_share: float
+    potential_gain_pct: float = 0.0
+    tp1_gain_pct: float = 0.0
+    potential_loss_pct: float = 0.0
+    dist_to_support_pct: float | None = None
+    dist_to_resistance_pct: float | None = None
+    index_aligned: bool = False
+    index_trend: Literal["bullish", "bearish", "neutral"] = "neutral"
 
 
 class BenchmarkSnapshot(BaseModel):

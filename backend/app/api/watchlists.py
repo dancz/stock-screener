@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -15,11 +15,13 @@ router = APIRouter(prefix="/watchlists", tags=["watchlists"])
 class WatchlistCreateBody(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     color: str = "#10b981"
+    horizon: Literal["short_term", "medium_term", "general"] = "general"
 
 
 class WatchlistUpdateBody(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=64)
     color: str | None = None
+    horizon: Literal["short_term", "medium_term", "general"] | None = None
 
 
 @router.get("")
@@ -36,6 +38,7 @@ def list_watchlists(db: Session = Depends(get_db)) -> dict[str, Any]:
                 "id": wl.id,
                 "name": wl.name,
                 "color": wl.color,
+                "horizon": wl.horizon or "general",
                 "symbols": sorted(by_wl.get(wl.id, [])),
                 "count": len(by_wl.get(wl.id, [])),
             }
@@ -51,11 +54,11 @@ def create_watchlist(body: WatchlistCreateBody, db: Session = Depends(get_db)) -
     if existing:
         raise HTTPException(status_code=409, detail=f"Watchlist '{name}' already exists.")
     max_order = db.query(Watchlist).count()
-    wl = Watchlist(name=name, color=body.color, sort_order=max_order)
+    wl = Watchlist(name=name, color=body.color, horizon=body.horizon, sort_order=max_order)
     db.add(wl)
     db.commit()
     db.refresh(wl)
-    return {"id": wl.id, "name": wl.name, "color": wl.color, "symbols": [], "count": 0}
+    return {"id": wl.id, "name": wl.name, "color": wl.color, "horizon": wl.horizon, "symbols": [], "count": 0}
 
 
 @router.patch("/{watchlist_id}")
@@ -71,9 +74,18 @@ def update_watchlist(watchlist_id: int, body: WatchlistUpdateBody, db: Session =
         wl.name = new_name
     if body.color is not None:
         wl.color = body.color
+    if body.horizon is not None:
+        wl.horizon = body.horizon
     db.commit()
     symbols = [r[0] for r in db.query(WatchlistItem.symbol).filter(WatchlistItem.watchlist_id == wl.id).all()]
-    return {"id": wl.id, "name": wl.name, "color": wl.color, "symbols": sorted(symbols), "count": len(symbols)}
+    return {
+        "id": wl.id,
+        "name": wl.name,
+        "color": wl.color,
+        "horizon": wl.horizon or "general",
+        "symbols": sorted(symbols),
+        "count": len(symbols),
+    }
 
 
 @router.delete("/{watchlist_id}")

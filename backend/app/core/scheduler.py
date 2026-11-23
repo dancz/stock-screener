@@ -5,7 +5,9 @@ from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
+from app.core.history_backfill import run_history_backfill_batch
 from app.core.pipeline import run_scan
 from app.db.database import session_scope
 from app.db.models import load_runtime_settings
@@ -62,6 +64,18 @@ def configure_scheduler(runtime_settings: dict[str, Any] | None = None) -> Backg
         id="pre_market_scan",
         replace_existing=True,
     )
+
+    hist_cfg = runtime_settings.get("history", {})
+    if hist_cfg.get("profile") == "production" or hist_cfg.get("backfill_enabled", False):
+        interval_min = max(5, int(hist_cfg.get("backfill_interval_minutes", 15)))
+        _scheduler.add_job(
+            run_history_backfill_batch,
+            IntervalTrigger(minutes=interval_min),
+            id="history_backfill_job",
+            replace_existing=True,
+        )
+        logger.info("Enabled background history backfill every %d min (profile=%s).", interval_min, hist_cfg.get("profile"))
+
     logger.info("Scheduled daily Mon-Fri scans at %02d:%02d and %02d:%02d (%s).", pre_h, pre_m, post_h, post_m, tz)
     return _scheduler
 

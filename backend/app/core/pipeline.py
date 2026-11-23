@@ -10,6 +10,7 @@ import pandas as pd
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from app.config import get_active_history_periods
 from app.core.contracts import (
     AnalysisContext,
     AnalyzerResult,
@@ -168,9 +169,9 @@ def _ensure_ticker_row(
     return row
 
 
-def _fetch_and_store_benchmarks(session: Session) -> tuple[dict[str, pd.DataFrame], MarketRegime]:
+def _fetch_and_store_benchmarks(session: Session, daily_period: str = "2y") -> tuple[dict[str, pd.DataFrame], MarketRegime]:
     ref_symbols = list(BENCHMARKS.keys()) + list(SECTORS.keys())
-    frames = fetch_daily_batch(ref_symbols, period="1y", chunk_size=20)
+    frames = fetch_daily_batch(ref_symbols, period=daily_period, chunk_size=20)
     for sym, df in frames.items():
         _ensure_ticker_row(session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym)
         upsert_candles(session, sym, "1d", df)
@@ -247,7 +248,12 @@ def _run_analysis_bundle(
     prev = float(daily_df["close"].iloc[-2]) if len(daily_df) >= 2 else spot
     chg_pct = ((spot / prev) - 1.0) * 100.0 if prev > 0 else 0.0
 
-    trade_plan, plan_overlay = build_trade_plan(spot, plugin_results, agg["bias"])
+    trade_plan, plan_overlay = build_trade_plan(
+        spot,
+        plugin_results,
+        agg["bias"],
+        benchmark_df=ctx.benchmark_df,
+    )
     overlays = list(agg["overlays"]) + [plan_overlay]
 
     # Options strategy proposals (only during deep enrichment)
@@ -390,9 +396,11 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             custom_syms = {row[0] for row in session.query(Ticker.symbol).filter(Ticker.is_custom.is_(True)).all()}
             priority_syms = watchlist_syms | custom_syms
 
+            daily_period, intraday_period, _ = get_active_history_periods(runtime_settings)
+
             # 1. Benchmarks & Market Regime
             _update_scan_status(stage="benchmarks", message="Fetching market regime (SPY/QQQ/IWM/VIX & Sectors)...")
-            bench_frames, market_regime = _fetch_and_store_benchmarks(session)
+            bench_frames, market_regime = _fetch_and_store_benchmarks(session, daily_period=daily_period)
             scan_run.market_regime_json = market_regime.model_dump_json()
             session.commit()
 
@@ -460,7 +468,7 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             )
 
             # 3. Stage 1: Batch Daily OHLCV + Fast Technical Pass
-            daily_frames = fetch_daily_batch(symbols, period="1y", chunk_size=60)
+            daily_frames = fetch_daily_batch(symbols, period=daily_period, chunk_size=60)
             _update_scan_status(stage="stage1_analyze", message=f"Running Stage 1 technical analysis on {len(daily_frames)} tickers...")
 
             stage1_bundles: dict[str, dict[str, Any]] = {}
@@ -513,7 +521,7 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             for idx, sym in enumerate(deep_list, start=1):
                 try:
                     df_1d = daily_frames[sym]
-                    df_1h = fetch_intraday_1h(sym, period="60d")
+                    df_1h = fetch_intraday_1h(sym, period=intraday_period)
                     if not df_1h.empty:
                         upsert_candles(session, sym, "1h", df_1h)
 
@@ -655,16 +663,17 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
 
     with session_scope() as session:
         runtime_settings = load_runtime_settings(session)
+        daily_period, intraday_period, _ = get_active_history_periods(runtime_settings)
         bench_frames = _load_benchmarks_from_db(session)
         market_regime: MarketRegime | None = None
-        if "SPY" not in bench_frames or "QQQ" not in bench_frames:
-            bench_frames, market_regime = _fetch_and_store_benchmarks(session)
+        if "SPY" not in bench_frames or "QQQ" not in bench_frames or len(bench_frames.get("SPY", [])) < 260:
+            bench_frames, market_regime = _fetch_and_store_benchmarks(session, daily_period=daily_period)
         else:
             market_regime = compute_market_regime(bench_frames)
 
         df_1d = load_candles_df(session, sym, "1d")
         if force_refresh or len(df_1d) < 30:
-            fetched = fetch_daily_batch([sym], period="1y", chunk_size=1)
+            fetched = fetch_daily_batch([sym], period=daily_period, chunk_size=1)
             if sym in fetched and not fetched[sym].empty:
                 df_1d = fetched[sym]
                 _ensure_ticker_row(session, sym, is_custom=True)
@@ -675,7 +684,7 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
 
         df_1h = load_candles_df(session, sym, "1h")
         if force_refresh or df_1h.empty:
-            df_1h = fetch_intraday_1h(sym, period="60d")
+            df_1h = fetch_intraday_1h(sym, period=intraday_period)
             if not df_1h.empty:
                 _ensure_ticker_row(session, sym, is_custom=True)
                 upsert_candles(session, sym, "1h", df_1h)

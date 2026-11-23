@@ -37,7 +37,7 @@ def get_settings(db: Session = Depends(get_db)) -> dict[str, Any]:
 @router.put("")
 def update_settings(payload: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
     updated = save_runtime_settings(db, payload)
-    if "schedule" in payload:
+    if "schedule" in payload or "history" in payload:
         configure_scheduler(updated)
     return {
         "settings": updated,

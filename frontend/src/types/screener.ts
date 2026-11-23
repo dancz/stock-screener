@@ -1,5 +1,7 @@
 export type Bias = "bullish" | "bearish" | "neutral";
 export type Severity = "high" | "medium" | "low" | "warning" | "info";
+export type SortBy = "score" | "risk_reward" | "potential_gain" | "tight_entry";
+export type WatchlistHorizon = "short_term" | "medium_term" | "general";
 
 export interface Signal {
   code: string;
@@ -27,6 +29,7 @@ export interface MetricItem {
 export type OverlayLayer =
   | "channels"
   | "sr_zones"
+  | "smart_money"
   | "price_action"
   | "trade_plan"
   | "emas"
@@ -62,6 +65,26 @@ export interface TradePlan {
   risk_reward: number;
   atr: number;
   risk_per_share: number;
+  potential_gain_pct: number;
+  tp1_gain_pct: number;
+  potential_loss_pct: number;
+  dist_to_support_pct: number | null;
+  dist_to_resistance_pct: number | null;
+  index_aligned: boolean;
+  index_trend: Bias;
+}
+
+export interface LiveQuote {
+  symbol: string;
+  price: number;
+  previous_close: number | null;
+  change_pct: number;
+  day_high: number | null;
+  day_low: number | null;
+  bid: number | null;
+  ask: number | null;
+  source: string;
+  timestamp: string;
 }
 
 export interface OptionLeg {
@@ -135,6 +158,14 @@ export interface ScreenerItem {
   composite_score: number;
   preset_scores: Record<string, number>;
   bias: Bias;
+  trade_direction: "LONG" | "SHORT" | "NEUTRAL";
+  risk_reward: number;
+  potential_gain_pct: number;
+  potential_loss_pct: number;
+  dist_to_support_pct: number | null;
+  dist_to_resistance_pct: number | null;
+  index_aligned: boolean;
+  index_trend: Bias;
   top_signals: Signal[];
   signal_codes: string[];
   risk_flags: RiskFlag[];
@@ -164,7 +195,8 @@ export interface MarketRegime {
 
 export interface ScreenerResponse {
   preset: string;
-  presets: Record<string, { name: string; description: string }>;
+  sort_by?: SortBy;
+  presets: Record<string, { name: string; description: string; weights: Record<string, number> }>;
   total: number;
   items: ScreenerItem[];
   market_regime: MarketRegime | null;
@@ -241,6 +273,7 @@ export interface Watchlist {
   id: number;
   name: string;
   color: string;
+  horizon: WatchlistHorizon;
   symbols: string[];
   count: number;
 }
@@ -256,6 +289,17 @@ export interface ScanStatus {
   started_at: string | null;
   finished_at: string | null;
   error: string | null;
+}
+
+export interface BackfillStatus {
+  running: boolean;
+  profile: string;
+  total_tickers: number;
+  hydrated_tickers: number;
+  last_batch_symbols: string[];
+  last_run_at: string | null;
+  last_source: string | null;
+  message: string;
 }
 
 export interface PluginDescriptor {
@@ -274,6 +318,19 @@ export interface RuntimeSettings {
   enabled_plugins: Record<string, boolean>;
   account: { equity: number; risk_pct: number };
   ibkr: { enabled: boolean; host: string; port: number; client_id: number };
+  history: {
+    profile: "dev" | "production";
+    dev_daily_period: string;
+    dev_intraday_period: string;
+    dev_weekly_period: string;
+    prod_daily_period: string;
+    prod_intraday_period: string;
+    prod_weekly_period: string;
+    backfill_enabled: boolean;
+    backfill_interval_minutes: number;
+    backfill_batch_size: number;
+    prefer_ibkr_history: boolean;
+  };
   data_sources: { finnhub_api_key: string; sec_user_agent: string };
   schedule: { enabled: boolean; timezone: string; post_market_time: string; pre_market_time: string };
   notifiers: {

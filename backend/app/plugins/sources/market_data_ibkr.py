@@ -5,7 +5,7 @@ import logging
 import math
 import socket
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -159,6 +159,141 @@ def fetch_option_chain_with_greeks(
             return pd.DataFrame(rows)
         except Exception as exc:
             logger.debug("IBKR option fetch fallback for %s: %s", symbol, exc)
+            return None
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    try:
+        return _run_async(_fetch())
+    except Exception:
+        return None
+
+
+def fetch_live_quote_ibkr(
+    symbol: str,
+    host: str,
+    port: int,
+    client_id: int,
+) -> dict[str, Any] | None:
+    """Read-only IBKR Gateway snapshot quote (supports delayed data when live subscription absent)."""
+    if not is_gateway_reachable(host, port, timeout=0.25):
+        return None
+
+    async def _fetch() -> dict[str, Any] | None:
+        from ib_async import IB, Stock
+
+        ib = IB()
+        try:
+            await ib.connectAsync(host, int(port), clientId=int(client_id) + 2, timeout=3.0, readonly=True)
+            ib.reqMarketDataType(3)
+            contract = Stock(symbol.upper(), "SMART", "USD")
+            qualified = await ib.qualifyContractsAsync(contract)
+            if not qualified:
+                return None
+            tickers = await ib.reqTickersAsync(qualified[0])
+            if not tickers:
+                return None
+            tk = tickers[0]
+            bid = float(tk.bid) if tk.bid and math.isfinite(tk.bid) and tk.bid > 0 else None
+            ask = float(tk.ask) if tk.ask and math.isfinite(tk.ask) and tk.ask > 0 else None
+            prev_close = float(tk.close) if tk.close and math.isfinite(tk.close) and tk.close > 0 else None
+            mp = tk.marketPrice()
+            price = (
+                float(mp)
+                if mp and math.isfinite(mp) and mp > 0
+                else (
+                    float(tk.last)
+                    if tk.last and math.isfinite(tk.last) and tk.last > 0
+                    else prev_close
+                )
+            )
+            if price is None or price <= 0:
+                return None
+            chg_pct = ((price / prev_close) - 1.0) * 100.0 if prev_close and prev_close > 0 else 0.0
+            return {
+                "symbol": symbol.upper(),
+                "price": round(price, 2),
+                "previous_close": round(prev_close, 2) if prev_close else None,
+                "change_pct": round(chg_pct, 2),
+                "day_high": float(tk.high) if tk.high and math.isfinite(tk.high) and tk.high > 0 else None,
+                "day_low": float(tk.low) if tk.low and math.isfinite(tk.low) and tk.low > 0 else None,
+                "bid": round(bid, 2) if bid else None,
+                "ask": round(ask, 2) if ask else None,
+                "source": "IBKR Gateway",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as exc:
+            logger.debug("IBKR live quote fallback for %s: %s", symbol, exc)
+            return None
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    try:
+        return _run_async(_fetch())
+    except Exception:
+        return None
+
+
+def fetch_historical_bars_ibkr(
+    symbol: str,
+    timeframe: Literal["1d", "1h", "1w"],
+    duration: str,
+    host: str,
+    port: int,
+    client_id: int,
+) -> pd.DataFrame | None:
+    """Read-only IBKR Gateway historical bar download with transparent fallback on failure."""
+    if not is_gateway_reachable(host, port, timeout=0.25):
+        return None
+
+    bar_size_map = {"1d": "1 day", "1h": "1 hour", "1w": "1 week"}
+    bar_size = bar_size_map[timeframe]
+
+    async def _fetch() -> pd.DataFrame | None:
+        from ib_async import IB, Stock
+
+        ib = IB()
+        try:
+            await ib.connectAsync(host, int(port), clientId=int(client_id) + 3, timeout=3.0, readonly=True)
+            contract = Stock(symbol.upper(), "SMART", "USD")
+            qualified = await ib.qualifyContractsAsync(contract)
+            if not qualified:
+                return None
+            bars = await ib.reqHistoricalDataAsync(
+                qualified[0],
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=2,
+                timeout=12.0,
+            )
+            if not bars:
+                return None
+            rows = []
+            for b in bars:
+                dt = b.date
+                if isinstance(dt, datetime):
+                    ts = int((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp())
+                else:
+                    ts = int(datetime.combine(dt, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+                rows.append(
+                    {
+                        "ts": ts,
+                        "open": float(b.open),
+                        "high": float(b.high),
+                        "low": float(b.low),
+                        "close": float(b.close),
+                        "volume": float(b.volume or 0.0),
+                    }
+                )
+            df = pd.DataFrame(rows)
+            return df.sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+        except Exception as exc:
+            logger.debug("IBKR historical bars fallback for %s (%s): %s", symbol, timeframe, exc)
             return None
         finally:
             if ib.isConnected():

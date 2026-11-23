@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Calculator, Crosshair } from "lucide-react";
+import { Calculator, Crosshair, TrendingUp } from "lucide-react";
 import { useScreenerStore } from "../store/useScreenerStore";
 
 export const TradePlanCard: React.FC = () => {
@@ -35,14 +35,28 @@ export const TradePlanCard: React.FC = () => {
 
   return (
     <section className="rounded-xl border border-border bg-panel p-4 flex flex-col gap-3">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Crosshair className="h-4 w-4 text-sky-400" />
           <h2 className="text-sm font-bold text-white">Trade Plan & Position Sizing</h2>
         </div>
-        <span className={`rounded border px-2 py-0.5 text-[11px] font-bold ${dirColor}`}>
-          {plan.direction} • {plan.risk_reward.toFixed(2)}R
-        </span>
+        <div className="flex items-center gap-1.5">
+          <span
+            className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[10px] font-semibold ${
+              plan.index_aligned
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                : "border-slate-600 bg-card text-slate-400"
+            }`}
+          >
+            <TrendingUp className="h-3 w-3" />
+            {plan.index_aligned
+              ? `${detail.primary_benchmark} Aligned`
+              : `Index: ${plan.index_trend}`}
+          </span>
+          <span className={`rounded border px-2 py-0.5 text-[11px] font-bold tabular-nums ${dirColor}`}>
+            {plan.direction} • {plan.risk_reward.toFixed(2)}R
+          </span>
+        </div>
       </div>
 
       <div className="rounded-lg bg-card/80 px-3 py-2">
@@ -56,11 +70,19 @@ export const TradePlanCard: React.FC = () => {
           <div className="mt-0.5 tabular-nums text-xs font-bold text-sky-300">
             ${plan.entry_low.toFixed(2)} – ${plan.entry_high.toFixed(2)}
           </div>
+          {plan.dist_to_support_pct != null && (
+            <div className="mt-0.5 text-[10px] text-slate-400 tabular-nums">
+              Sup {plan.dist_to_support_pct.toFixed(1)}% / Res {plan.dist_to_resistance_pct?.toFixed(1) ?? "—"}%
+            </div>
+          )}
         </div>
         <div className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-rose-300/80">Stop-Loss</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-rose-300">
             ${plan.stop_loss.toFixed(2)}
+          </div>
+          <div className="mt-0.5 tabular-nums text-[10px] font-medium text-rose-400">
+            -{plan.potential_loss_pct.toFixed(1)}% Risk
           </div>
         </div>
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
@@ -68,11 +90,17 @@ export const TradePlanCard: React.FC = () => {
           <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">
             ${plan.tp1.toFixed(2)}
           </div>
+          <div className="mt-0.5 tabular-nums text-[10px] font-medium text-emerald-400">
+            +{plan.tp1_gain_pct.toFixed(1)}% Gain
+          </div>
         </div>
         <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
           <div className="text-[10px] uppercase tracking-wider text-emerald-300/80">Target 2</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-emerald-300">
             ${plan.tp2.toFixed(2)}
+          </div>
+          <div className="mt-0.5 tabular-nums text-[10px] font-medium text-emerald-400">
+            +{plan.potential_gain_pct.toFixed(1)}% Gain
           </div>
         </div>
       </div>

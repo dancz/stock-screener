@@ -54,7 +54,7 @@ class PriceActionSRAnalyzer(AnalyzerPlugin):
                 summary="Insufficient price history for S/R analysis.",
             )
 
-        work = df.tail(252).reset_index(drop=True)
+        work = df.tail(500).reset_index(drop=True)
         highs = work["high"].to_numpy(dtype=float)
         lows = work["low"].to_numpy(dtype=float)
         opens = work["open"].to_numpy(dtype=float)

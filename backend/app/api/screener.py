@@ -26,6 +26,8 @@ def get_screener(
     signal: str | None = Query(default=None),
     bias: str | None = Query(default=None),
     exclude_earnings_days: int | None = Query(default=None),
+    index_aligned_only: bool = Query(default=False),
+    sort_by: str = Query(default="score", pattern="^(score|risk_reward|potential_gain|tight_entry)$"),
     search: str | None = Query(default=None),
     min_score: float | None = Query(default=None),
     limit: int = Query(default=250, ge=1, le=1000),
@@ -33,6 +35,10 @@ def get_screener(
 ) -> dict[str, Any]:
     runtime_settings = load_runtime_settings(db)
     presets = runtime_settings.get("presets", {})
+    preset_meta = {
+        k: {"name": v["name"], "description": v.get("description", ""), "weights": v.get("weights", {})}
+        for k, v in presets.items()
+    }
     subq = latest_snapshot_subquery(db)
 
     query = (
@@ -49,7 +55,7 @@ def get_screener(
         if not wl_syms:
             return {
                 "preset": preset,
-                "presets": {k: {"name": v["name"], "description": v.get("description", "")} for k, v in presets.items()},
+                "presets": preset_meta,
                 "total": 0,
                 "items": [],
                 "market_regime": get_latest_market_regime(db),
@@ -73,6 +79,8 @@ def get_screener(
         item = serialize_snapshot_summary(snap, ticker, preset, wl_map.get(snap.symbol, []))
         if min_score is not None and item["score"] < min_score:
             continue
+        if index_aligned_only and not item.get("index_aligned"):
+            continue
         if wanted_signals:
             item_codes = set(item["signal_codes"])
             if not (item_codes & wanted_signals):
@@ -83,10 +91,29 @@ def get_screener(
                 continue
         items.append(item)
 
-    items.sort(key=lambda x: x["score"], reverse=True)
+    if sort_by == "risk_reward":
+        items.sort(key=lambda x: (bool(x.get("index_aligned")), x.get("risk_reward", 0.0), x["score"]), reverse=True)
+    elif sort_by == "potential_gain":
+        items.sort(
+            key=lambda x: (x.get("risk_reward", 0.0) >= 1.5, x.get("potential_gain_pct", 0.0), x.get("risk_reward", 0.0)),
+            reverse=True,
+        )
+    elif sort_by == "tight_entry":
+        items.sort(
+            key=lambda x: (
+                1 if x.get("risk_reward", 0.0) >= 1.5 else 0,
+                -(x.get("potential_loss_pct") if x.get("potential_loss_pct", 0.0) > 0 else 999.0),
+                x["score"],
+            ),
+            reverse=True,
+        )
+    else:
+        items.sort(key=lambda x: x["score"], reverse=True)
+
     return {
         "preset": preset,
-        "presets": {k: {"name": v["name"], "description": v.get("description", "")} for k, v in presets.items()},
+        "sort_by": sort_by,
+        "presets": preset_meta,
         "total": len(items),
         "items": items[:limit],
         "market_regime": get_latest_market_regime(db),

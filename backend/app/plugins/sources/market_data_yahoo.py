@@ -112,13 +112,85 @@ def fetch_daily_batch(symbols: list[str], period: str = "1y", chunk_size: int = 
     return out
 
 
-def fetch_intraday_1h(symbol: str, period: str = "60d") -> pd.DataFrame:
+def fetch_intraday_1h(symbol: str, period: str = "120d") -> pd.DataFrame:
     try:
         hist = yf.Ticker(symbol).history(period=period, interval="1h", auto_adjust=True)
         return normalize_ohlcv_df(hist)
     except Exception as exc:
         logger.debug("Yahoo 1h fetch failed for %s: %s", symbol, exc)
         return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+
+
+def fetch_weekly_bars(symbol: str, period: str = "10y") -> pd.DataFrame:
+    try:
+        hist = yf.Ticker(symbol).history(period=period, interval="1wk", auto_adjust=True)
+        return normalize_ohlcv_df(hist)
+    except Exception as exc:
+        logger.debug("Yahoo 1w fetch failed for %s: %s", symbol, exc)
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+
+
+def resample_daily_to_weekly(daily_df: pd.DataFrame) -> pd.DataFrame:
+    if daily_df is None or daily_df.empty:
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+    work = daily_df.copy()
+    work["dt"] = pd.to_datetime(work["ts"], unit="s", utc=True)
+    work = work.set_index("dt").sort_index()
+    agg = work.resample("W-MON", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna(subset=["open", "high", "low", "close"])
+    agg["ts"] = [int(t.timestamp()) for t in agg.index]
+    return agg[["ts", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+
+
+def fetch_live_quote(symbol: str) -> dict[str, Any] | None:
+    """Fetch near-real-time quote via Yahoo Finance fast_info with 5m bar fallback."""
+    sym = symbol.strip().upper().replace(".", "-")
+    try:
+        tk = yf.Ticker(sym)
+        fi = getattr(tk, "fast_info", None)
+        price = _safe_float(getattr(fi, "last_price", None)) if fi is not None else None
+        prev_close = _safe_float(getattr(fi, "previous_close", None)) if fi is not None else None
+        day_high = _safe_float(getattr(fi, "day_high", None)) if fi is not None else None
+        day_low = _safe_float(getattr(fi, "day_low", None)) if fi is not None else None
+
+        if price is None:
+            hist = tk.history(period="5d", interval="5m", auto_adjust=True)
+            norm = normalize_ohlcv_df(hist)
+            if not norm.empty:
+                price = float(norm["close"].iloc[-1])
+                if day_high is None:
+                    day_high = float(norm["high"].iloc[-1])
+                if day_low is None:
+                    day_low = float(norm["low"].iloc[-1])
+
+        if price is None:
+            hist_1d = tk.history(period="5d", interval="1d", auto_adjust=True)
+            norm_1d = normalize_ohlcv_df(hist_1d)
+            if not norm_1d.empty:
+                price = float(norm_1d["close"].iloc[-1])
+                if prev_close is None and len(norm_1d) >= 2:
+                    prev_close = float(norm_1d["close"].iloc[-2])
+
+        if price is None or price <= 0:
+            return None
+
+        chg_pct = ((price / prev_close) - 1.0) * 100.0 if prev_close and prev_close > 0 else 0.0
+        return {
+            "symbol": sym,
+            "price": round(price, 2),
+            "previous_close": round(prev_close, 2) if prev_close else None,
+            "change_pct": round(chg_pct, 2),
+            "day_high": round(day_high, 2) if day_high else None,
+            "day_low": round(day_low, 2) if day_low else None,
+            "bid": None,
+            "ask": None,
+            "source": "Yahoo Live",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        logger.debug("Yahoo live quote failed for %s: %s", sym, exc)
+        return None
 
 
 def fetch_fundamentals_and_events(symbol: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:

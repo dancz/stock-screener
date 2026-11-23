@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { CheckCircle2, Plug, Save, X, XCircle } from "lucide-react";
+import { CheckCircle2, Database, Plug, RefreshCw, Save, X, XCircle } from "lucide-react";
 import { api } from "../api/client";
 import { useScreenerStore } from "../store/useScreenerStore";
 import type { RuntimeSettings } from "../types/screener";
@@ -12,7 +12,10 @@ interface SettingsModalProps {
 export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) => {
   const settings = useScreenerStore((s) => s.settings);
   const plugins = useScreenerStore((s) => s.plugins);
+  const backfillStatus = useScreenerStore((s) => s.backfillStatus);
   const updateSettings = useScreenerStore((s) => s.updateSettings);
+  const triggerBackfill = useScreenerStore((s) => s.triggerBackfill);
+  const fetchBackfillStatus = useScreenerStore((s) => s.fetchBackfillStatus);
 
   const [tab, setTab] = useState<"presets" | "ibkr" | "alerts">("presets");
   const [draft, setDraft] = useState<RuntimeSettings | null>(null);
@@ -25,8 +28,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
       setDraft(JSON.parse(JSON.stringify(settings)));
       setIbkrTestRes(null);
       setNotifTestRes(null);
+      fetchBackfillStatus();
     }
-  }, [open, settings]);
+  }, [open, settings, fetchBackfillStatus]);
 
   if (!open || !draft) return null;
 
@@ -275,6 +279,123 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                     </span>
                   )}
                 </div>
+              </div>
+
+              <div className="rounded-lg border border-border bg-canvas/80 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-400">
+                      <Database className="h-3.5 w-3.5 text-sky-400" />
+                      Historical Depth &amp; Background Backfill
+                    </h3>
+                    <p className="text-[11px] text-slate-400">
+                      Dev keeps data light (2Y 1D / 120D 1H). Production (Raspberry Pi) stores 5Y 1D, 10Y 1W, 1Y 1H and continuously hydrates tickers in batches.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  {(["dev", "production"] as const).map((prof) => (
+                    <button
+                      key={prof}
+                      type="button"
+                      onClick={() =>
+                        setDraft({
+                          ...draft,
+                          history: {
+                            ...draft.history,
+                            profile: prof,
+                            backfill_enabled: prof === "production",
+                          },
+                        })
+                      }
+                      className={`rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
+                        draft.history.profile === prof
+                          ? "border-sky-500 bg-sky-500/15 text-white"
+                          : "border-border bg-panel text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      <div className="font-bold">
+                        {prof === "dev" ? "Development Mode (Light)" : "Production / Raspberry Pi (Deep)"}
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        {prof === "dev"
+                          ? "2Y Daily • 120D 1H • Manual backfill"
+                          : "5Y Daily • 10Y Weekly • 1Y 1H • Auto backfill"}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block">
+                    <span className="text-xs text-slate-300">Backfill Batch Size (tickers/run)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      value={draft.history.backfill_batch_size}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          history: { ...draft.history, backfill_batch_size: Number(e.target.value) || 5 },
+                        })
+                      }
+                      className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-slate-300">Backfill Interval (minutes)</span>
+                    <input
+                      type="number"
+                      min={5}
+                      max={180}
+                      value={draft.history.backfill_interval_minutes}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          history: { ...draft.history, backfill_interval_minutes: Number(e.target.value) || 15 },
+                        })
+                      }
+                      className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                    />
+                  </label>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={draft.history.prefer_ibkr_history}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          history: { ...draft.history, prefer_ibkr_history: e.target.checked },
+                        })
+                      }
+                      className="h-4 w-4 accent-sky-500"
+                    />
+                    <span>Prefer IBKR Gateway for extended history (Yahoo fallback)</span>
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => triggerBackfill()}
+                    className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-3 py-1.5 text-xs font-semibold text-white hover:border-sky-500"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 text-sky-400 ${backfillStatus?.running ? "animate-spin" : ""}`} />
+                    Run Backfill Batch Now
+                  </button>
+                </div>
+
+                {backfillStatus && (
+                  <div className="rounded bg-panel px-3 py-1.5 text-[11px] text-slate-300 flex items-center justify-between gap-2">
+                    <span>
+                      Hydrated: <strong>{backfillStatus.hydrated_tickers}</strong> / {backfillStatus.total_tickers} tickers
+                    </span>
+                    <span className="truncate text-slate-400">{backfillStatus.message}</span>
+                  </div>
+                )}
               </div>
 
               <div className="rounded-lg border border-border bg-canvas/80 p-4 space-y-3">

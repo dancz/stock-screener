@@ -37,6 +37,7 @@ def serialize_snapshot_summary(
     signals = json.loads(snap.signals_json or "[]")
     risk_flags = json.loads(snap.risk_flags_json or "[]")
     events_insiders = json.loads(snap.events_insiders_json or "{}")
+    trade_plan = json.loads(snap.trade_plan_json or "{}")
 
     score = float(preset_scores.get(preset_id, snap.composite_score))
     return {
@@ -51,6 +52,14 @@ def serialize_snapshot_summary(
         "composite_score": snap.composite_score,
         "preset_scores": preset_scores,
         "bias": snap.bias,
+        "trade_direction": trade_plan.get("direction", "NEUTRAL"),
+        "risk_reward": float(trade_plan.get("risk_reward") or 0.0),
+        "potential_gain_pct": float(trade_plan.get("potential_gain_pct") or 0.0),
+        "potential_loss_pct": float(trade_plan.get("potential_loss_pct") or 0.0),
+        "dist_to_support_pct": trade_plan.get("dist_to_support_pct"),
+        "dist_to_resistance_pct": trade_plan.get("dist_to_resistance_pct"),
+        "index_aligned": bool(trade_plan.get("index_aligned", False)),
+        "index_trend": trade_plan.get("index_trend", "neutral"),
         "top_signals": signals[:3],
         "signal_codes": [s.get("code") for s in signals],
         "risk_flags": risk_flags,

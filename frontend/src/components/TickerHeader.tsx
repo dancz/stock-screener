@@ -1,11 +1,13 @@
 import React from "react";
-import { AlertTriangle, RefreshCw } from "lucide-react";
+import { AlertTriangle, HelpCircle, Radio, RefreshCw } from "lucide-react";
 import { useScreenerStore } from "../store/useScreenerStore";
 import { WatchlistPopover } from "./WatchlistPopover";
 
 export const TickerHeader: React.FC = () => {
   const detail = useScreenerStore((s) => s.selectedDetail);
+  const liveQuote = useScreenerStore((s) => s.liveQuote);
   const activePreset = useScreenerStore((s) => s.activePreset);
+  const presets = useScreenerStore((s) => s.presets);
   const loadingDetail = useScreenerStore((s) => s.loadingDetail);
   const refreshStock = useScreenerStore((s) => s.refreshStock);
 
@@ -18,6 +20,19 @@ export const TickerHeader: React.FC = () => {
       : presetScore >= 58
       ? "border-sky-500/40 bg-sky-500/15 text-sky-300"
       : "border-amber-500/40 bg-amber-500/15 text-amber-300";
+
+  const scoreTier =
+    presetScore >= 80
+      ? "A+ Setup"
+      : presetScore >= 68
+      ? "Strong"
+      : presetScore >= 55
+      ? "Watch"
+      : "Weak";
+
+  const displayPrice = liveQuote ? liveQuote.price : detail.last_price;
+  const displayChg = liveQuote ? liveQuote.change_pct : detail.change_pct;
+  const presetName = presets[activePreset]?.name || activePreset;
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-panel p-4">
@@ -33,18 +48,46 @@ export const TickerHeader: React.FC = () => {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 pt-0.5">
-          <span className="tabular-nums text-lg font-bold text-white">${detail.last_price.toFixed(2)}</span>
+          <span className="tabular-nums text-lg font-bold text-white">${displayPrice.toFixed(2)}</span>
           <span
             className={`tabular-nums text-sm font-semibold ${
-              detail.change_pct >= 0 ? "text-emerald-400" : "text-rose-400"
+              displayChg >= 0 ? "text-emerald-400" : "text-rose-400"
             }`}
           >
-            {detail.change_pct >= 0 ? "+" : ""}
-            {detail.change_pct.toFixed(2)}%
+            {displayChg >= 0 ? "+" : ""}
+            {displayChg.toFixed(2)}%
           </span>
 
-          <span className={`rounded-md border px-2 py-0.5 text-xs font-bold tabular-nums ${scoreClass}`}>
-            Score {presetScore.toFixed(1)}
+          {liveQuote ? (
+            <span
+              title={`Live quote fetched at ${new Date(liveQuote.timestamp).toLocaleTimeString()}${
+                liveQuote.bid && liveQuote.ask ? ` (Bid ${liveQuote.bid} / Ask ${liveQuote.ask})` : ""
+              }`}
+              className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300"
+            >
+              <Radio className="h-2.5 w-2.5 animate-pulse" />
+              LIVE • {liveQuote.source}
+            </span>
+          ) : (
+            <span className="rounded bg-card px-1.5 py-0.5 text-[10px] text-slate-400">
+              Snapshot price
+            </span>
+          )}
+
+          {liveQuote && Math.abs(liveQuote.price - detail.last_price) >= 0.02 && (
+            <span className="text-[11px] text-slate-400 tabular-nums">
+              (Scan: ${detail.last_price.toFixed(2)})
+            </span>
+          )}
+
+          <span
+            title={`Preset "${presetName}" weighted score (0–100): 80+ A+ Setup | 68–79 Strong | 55–67 Watch | <55 Weak. See breakdown card below for exact formula.`}
+            className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs font-bold tabular-nums ${scoreClass}`}
+          >
+            <span>
+              Score {presetScore.toFixed(1)} • {scoreTier}
+            </span>
+            <HelpCircle className="h-3 w-3 opacity-75" />
           </span>
 
           <span
