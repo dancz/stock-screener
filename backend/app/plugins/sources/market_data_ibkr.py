@@ -247,6 +247,8 @@ def fetch_live_quotes_batch_ibkr(
     if not unique or not is_gateway_reachable(host, port, timeout=0.25):
         return {}
 
+    ibkr_to_db = {sym.replace("-", " "): sym for sym in unique}
+
     async def _fetch_batch() -> dict[str, dict[str, Any]]:
         from ib_async import IB, Stock
 
@@ -255,16 +257,21 @@ def fetch_live_quotes_batch_ibkr(
         try:
             await ib.connectAsync(host, int(port), clientId=int(client_id) + 4, timeout=3.0, readonly=True)
             ib.reqMarketDataType(3)
-            contracts = [Stock(sym, "SMART", "USD") for sym in unique]
+            contracts = [Stock(sym.replace("-", " "), "SMART", "USD") for sym in unique]
             qualified = await asyncio.wait_for(ib.qualifyContractsAsync(*contracts), timeout=4.0)
-            valid_contracts = [c for c in (qualified or []) if c is not None]
+            valid_contracts = [c for c in (qualified or []) if c is not None and getattr(c, "conId", 0)]
             if not valid_contracts:
                 return out
-            tickers = await asyncio.wait_for(ib.reqTickersAsync(*valid_contracts), timeout=6.0)
+            try:
+                tickers = await asyncio.wait_for(ib.reqTickersAsync(*valid_contracts), timeout=8.5)
+            except asyncio.TimeoutError:
+                # Preserve any partial quotes populated before the timeout (e.g. cold usfarm connect)
+                tickers = ib.tickers()
             now_iso = datetime.now(timezone.utc).isoformat()
             for tk in tickers or []:
                 c = getattr(tk, "contract", None)
-                sym = str(getattr(c, "symbol", "") or "").upper()
+                raw_sym = str(getattr(c, "symbol", "") or "").upper()
+                sym = ibkr_to_db.get(raw_sym, raw_sym)
                 if not sym:
                     continue
                 bid = float(tk.bid) if tk.bid and math.isfinite(tk.bid) and tk.bid > 0 else None

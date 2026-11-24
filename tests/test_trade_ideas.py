@@ -970,10 +970,19 @@ def test_trade_ideas_live_quotes_drift_and_hide_stale(tmp_path: Path):
         "STOPPED": {"symbol": "STOPPED", "price": 105.6, "change_pct": 5.6, "source": "IBKR Gateway"},
     }
 
+    captured_syms: list[str] = []
+
+    def _fetcher(syms: list[str]) -> dict[str, dict]:
+        captured_syms.extend(syms)
+        return quotes
+
     with session_scope() as session:
-        filtered = build_trade_ideas(session, live_quotes=quotes, hide_stale=True)
+        filtered = build_trade_ideas(session, live_quote_fetcher=_fetcher, hide_stale=True)
         unfiltered = build_trade_ideas(session, live_quotes=quotes, hide_stale=False)
 
+    assert len(captured_syms) == 4
+    assert captured_syms[1] == "STOPPED"  # BUY & SELL interleaved evenly before remaining BUYs
+    assert set(captured_syms) == {"INZONE", "MISSED", "HITTP", "STOPPED"}
     assert filtered["live_quotes_checked"] is True
     assert filtered["filtered_stale_count"] == 2  # HITTP + STOPPED
     assert [b["symbol"] for b in filtered["buys"]] == ["INZONE", "MISSED"]

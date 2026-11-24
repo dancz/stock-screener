@@ -1126,13 +1126,19 @@ def build_trade_ideas(
     buys.sort(key=base_sort_key, reverse=True)
     sells.sort(key=base_sort_key, reverse=True)
 
-    pool_cap = max(limit * 3, limit)
+    pool_cap = min(max(limit * 2, limit), 20)
     buy_pool = buys[:pool_cap]
     sell_pool = sells[:pool_cap]
 
     quotes_map = live_quotes
     if quotes_map is None and live_quote_fetcher is not None:
-        candidate_syms = list(dict.fromkeys([x["symbol"] for x in buy_pool + sell_pool]))
+        interleaved: list[str] = []
+        for b_item, s_item in zip(buy_pool, sell_pool):
+            interleaved.append(b_item["symbol"])
+            interleaved.append(s_item["symbol"])
+        interleaved.extend(x["symbol"] for x in buy_pool[len(sell_pool) :])
+        interleaved.extend(x["symbol"] for x in sell_pool[len(buy_pool) :])
+        candidate_syms = list(dict.fromkeys(interleaved))
         quotes_map = live_quote_fetcher(candidate_syms) if candidate_syms else {}
     quotes_map = quotes_map or {}
 
