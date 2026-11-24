@@ -98,3 +98,52 @@ def test_swing_options_neutral_iron_condor():
 
     names = [p.strategy_name for p in out["proposals"]]
     assert any("Iron Condor" in n for n in names)
+
+
+def test_swing_options_filters_stale_quotes_and_collapsed_delta():
+    closes = 100.0 + 3.0 * np.sin(np.arange(80) * 0.6)  # hv20 ~ 20.2%
+    df = make_ohlcv_from_closes(closes)
+    chain = _make_synthetic_chain(spot=100.0, iv=0.20, dte=30)  # iv/hv ~ 1.0 -> normal regime (Long Call / Debit Spread)
+
+    # Corrupt upstream delta to 0.0 (collapsed) across liquid rows -> must fall back to BS analytical delta
+    chain["delta"] = 0.0
+    # Inject a stale one-sided ITM call quote ($90 strike mid=$30.10 -> +$20.10 fake extrinsic when bid=0)
+    stale_row = pd.DataFrame(
+        [
+            {
+                "option_type": "CALL",
+                "strike": 90.0,
+                "expiry": "2026-12-27",
+                "dte": 30,
+                "bid": 0.0,
+                "ask": 35.0,
+                "mid_price": 30.10,
+                "iv": 0.20,
+                "oi": 10,
+                "volume": 0,
+                "delta": 0.0,
+            }
+        ]
+    )
+    dirty_chain = pd.concat(
+        [chain[~((chain["strike"] == 90.0) & (chain["option_type"] == "CALL"))], stale_row],
+        ignore_index=True,
+    )
+
+    out = SwingOptionsStrategyPlugin().propose(
+        OptionAnalysisContext(
+            symbol="CHRD",
+            spot_price=100.0,
+            daily_df=df,
+            chain_df=dirty_chain,
+            bias="bullish",
+            nearest_support=95.0,
+            nearest_resistance=108.0,
+        )
+    )
+
+    assert len(out["proposals"]) >= 1
+    for prop in out["proposals"]:
+        assert all((leg.option_type, leg.strike) != ("CALL", 90.0) for leg in prop.legs)
+        assert prop.pop_estimate is None or (15.0 <= prop.pop_estimate <= 88.0)
+        assert all(leg.delta is not None and abs(leg.delta) > 0.05 for leg in prop.legs)

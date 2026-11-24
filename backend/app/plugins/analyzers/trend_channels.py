@@ -149,14 +149,15 @@ class TrendChannelsAnalyzer(AnalyzerPlugin):
         elif near_upper:
             pts = 20.0 if slope_type == "descending" else 14.0
             score += pts
+            is_bearish_cap = (slope_type == "descending") or (pos_pct >= 92.0)
             if slope_type == "descending":
                 bias = "bearish"
             signals.append(
                 Signal(
                     code="UPPER_CHANNEL_TOUCH",
                     label="Upper Channel Touch",
-                    direction="bearish" if slope_type == "descending" else "neutral",
-                    severity="medium",
+                    direction="bearish" if is_bearish_cap else "neutral",
+                    severity="high" if is_bearish_cap else "medium",
                     score_impact=pts,
                     detail=f"Testing upper rail (${upper_now:.2f}) of {best['window']}d {slope_type} channel.",
                 )

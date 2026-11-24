@@ -21,6 +21,36 @@ import { WatchlistPopover } from "./WatchlistPopover";
 
 type SideFilter = "all" | "buys" | "sells";
 
+const LIVE_STATUS_META: Record<
+  NonNullable<TradeIdea["live_status"]>,
+  { label: string; badgeClass: string }
+> = {
+  IN_ZONE: {
+    label: "Live: In Entry Zone",
+    badgeClass: "border-emerald-500/40 bg-emerald-500/15 text-emerald-300",
+  },
+  MISSED_ENTRY: {
+    label: "Missed Entry — Wait Pullback",
+    badgeClass: "border-amber-500/40 bg-amber-500/15 text-amber-300",
+  },
+  BELOW_ENTRY: {
+    label: "Live: Below Entry",
+    badgeClass: "border-sky-500/40 bg-sky-500/15 text-sky-300",
+  },
+  ABOVE_ENTRY: {
+    label: "Live: Above Entry",
+    badgeClass: "border-amber-500/40 bg-amber-500/15 text-amber-300",
+  },
+  TARGET_HIT: {
+    label: "Target Hit — Stale",
+    badgeClass: "border-slate-500/40 bg-slate-500/20 text-slate-300",
+  },
+  STOP_HIT: {
+    label: "Stop Hit — Invalidated",
+    badgeClass: "border-rose-500/50 bg-rose-500/20 text-rose-300",
+  },
+};
+
 const CATEGORY_COLORS: Record<string, string> = {
   "Smart Money": "border-violet-500/40 bg-violet-500/15 text-violet-300",
   "Trend Channel": "border-sky-500/40 bg-sky-500/15 text-sky-300",
@@ -49,7 +79,14 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
   const rr = Number(idea.risk_reward ?? 0);
   const tp1Rr = Number(idea.tp1_risk_reward ?? 0);
   const lastPrice = Number(idea.last_price ?? 0);
+  const livePrice = idea.live_price != null ? Number(idea.live_price) : null;
+  const displayPrice = livePrice ?? lastPrice;
+  const liveChangePct = idea.live_change_pct != null ? Number(idea.live_change_pct) : null;
   const changePct = Number(idea.change_pct ?? 0);
+  const displayChangePct = liveChangePct ?? changePct;
+  const driftPct = idea.price_drift_pct != null ? Number(idea.price_drift_pct) : null;
+  const liveStatusMeta = idea.live_status ? LIVE_STATUS_META[idea.live_status] : null;
+  const isStaleStatus = idea.live_status === "STOP_HIT" || idea.live_status === "TARGET_HIT";
   const tp1GainPct = Number(idea.tp1_gain_pct ?? 0);
   const tp2GainPct = Number(idea.potential_gain_pct ?? 0);
   const lossPct = Number(idea.potential_loss_pct ?? 0);
@@ -58,11 +95,12 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
   const estShares = riskDollars > 0 ? Math.max(0, Math.floor(riskDollars / riskPerShare)) : 0;
   const estPosValue = estShares * midEntry;
 
-  const accentBorder = idea.has_conflict
-    ? "border-amber-500/40 hover:border-amber-500/70"
-    : isLong
-    ? "border-emerald-500/30 hover:border-emerald-500/60"
-    : "border-rose-500/30 hover:border-rose-500/60";
+  const accentBorder =
+    isStaleStatus || idea.has_conflict
+      ? "border-amber-500/40 hover:border-amber-500/70"
+      : isLong
+      ? "border-emerald-500/30 hover:border-emerald-500/60"
+      : "border-rose-500/30 hover:border-rose-500/60";
   const badgeStyle = isLong
     ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
     : "border-rose-500/40 bg-rose-500/15 text-rose-300";
@@ -71,10 +109,12 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
     idea.conviction_score >= 82
       ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
       : idea.conviction_score >= 72
-      ? "border-sky-500/40 bg-sky-500/15 text-sky-300"
-      : "border-amber-500/40 bg-amber-500/15 text-amber-300";
+        ? "border-sky-500/40 bg-sky-500/15 text-sky-300"
+        : "border-amber-500/40 bg-amber-500/15 text-amber-300";
 
-  const snapshotTooltip = idea.analyzed_at
+  const snapshotTooltip = livePrice != null
+    ? `Live price via ${idea.live_source || "IBKR"} (Snapshot: $${lastPrice.toFixed(2)})`
+    : idea.analyzed_at
     ? `Snapshot close at ${new Date(idea.analyzed_at).toLocaleString()}`
     : "Latest stored snapshot";
 
@@ -109,11 +149,10 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
 
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px]">
             <span
-              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-semibold ${
-                idea.index_aligned
-                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                  : "border-slate-700 bg-card text-slate-400"
-              }`}
+              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-semibold ${idea.index_aligned
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                : "border-slate-700 bg-card text-slate-400"
+                }`}
             >
               {idea.index_aligned ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
               {idea.index_aligned
@@ -125,6 +164,12 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
               {idea.setup_name}
             </span>
 
+            {liveStatusMeta && (
+              <span className={`rounded border px-1.5 py-0.5 font-semibold ${liveStatusMeta.badgeClass}`}>
+                {liveStatusMeta.label}
+              </span>
+            )}
+
             {idea.fundamental_grade && (
               <span className="rounded border border-teal-500/30 bg-teal-500/10 px-1.5 py-0.5 font-semibold text-teal-300">
                 Health {idea.fundamental_grade}
@@ -133,17 +178,16 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
 
             {idea.days_to_earnings != null && (
               <span
-                className={`rounded border px-1.5 py-0.5 font-medium ${
-                  idea.days_to_earnings >= 0 && idea.days_to_earnings <= 10
-                    ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
-                    : "border-border bg-card text-slate-400"
-                }`}
+                className={`rounded border px-1.5 py-0.5 font-medium ${idea.days_to_earnings >= 0 && idea.days_to_earnings <= 10
+                  ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                  : "border-border bg-card text-slate-400"
+                  }`}
               >
                 {idea.days_to_earnings < 0
                   ? `Reported ${Math.abs(idea.days_to_earnings)}d ago`
                   : idea.days_to_earnings === 0
-                  ? "Earnings Today"
-                  : `Earnings in ${idea.days_to_earnings}d`}
+                    ? "Earnings Today"
+                    : `Earnings in ${idea.days_to_earnings}d`}
               </span>
             )}
 
@@ -157,14 +201,27 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
 
         <div className="flex shrink-0 items-center gap-2.5 text-right" title={snapshotTooltip}>
           <div>
-            <div className="tabular-nums text-sm font-bold text-white">${lastPrice.toFixed(2)}</div>
+            <div className="flex items-center justify-end gap-1.5 tabular-nums text-sm font-bold text-white">
+              {livePrice != null && (
+                <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  Live
+                </span>
+              )}
+              <span>${displayPrice.toFixed(2)}</span>
+            </div>
             <div
               className={`tabular-nums text-[11px] font-semibold ${
-                changePct >= 0 ? "text-emerald-400" : "text-rose-400"
+                displayChangePct >= 0 ? "text-emerald-400" : "text-rose-400"
               }`}
             >
-              {changePct >= 0 ? "+" : ""}
-              {changePct.toFixed(2)}% <span className="text-[10px] font-normal text-slate-400">(1D)</span>
+              {displayChangePct >= 0 ? "+" : ""}
+              {displayChangePct.toFixed(2)}%{" "}
+              <span className="text-[10px] font-normal text-slate-400">
+                {livePrice != null && driftPct != null && Math.abs(driftPct) >= 0.05
+                  ? `(Snap ${driftPct >= 0 ? "+" : ""}${driftPct.toFixed(1)}%)`
+                  : "(1D)"}
+              </span>
             </div>
           </div>
           <div className={`rounded-lg border px-2.5 py-1 text-center ${convictionColor}`}>
@@ -224,11 +281,18 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
         <div className="col-span-2 rounded-lg border border-border/70 bg-canvas p-2 sm:col-span-1">
           <div className="text-[10px] uppercase tracking-wider text-slate-400">R:R / Size</div>
           <div className="mt-0.5 tabular-nums text-xs font-bold text-white">{rr.toFixed(2)}x Entry</div>
-          {idea.spot_rr_tp2 != null && (
-            <div className="mt-0.5 tabular-nums text-[10px] text-slate-300">
-              At Spot: {Number(idea.spot_rr_tp2).toFixed(2)}x (TP1{" "}
-              {idea.spot_rr_tp1 != null ? Number(idea.spot_rr_tp1).toFixed(2) : "—"}x)
+          {idea.live_rr_tp2 != null ? (
+            <div className="mt-0.5 tabular-nums text-[10px] font-medium text-sky-300">
+              At Live: {Number(idea.live_rr_tp2).toFixed(2)}x (TP1{" "}
+              {idea.live_rr_tp1 != null ? Number(idea.live_rr_tp1).toFixed(2) : "—"}x)
             </div>
+          ) : (
+            idea.spot_rr_tp2 != null && (
+              <div className="mt-0.5 tabular-nums text-[10px] text-slate-300">
+                At Spot: {Number(idea.spot_rr_tp2).toFixed(2)}x (TP1{" "}
+                {idea.spot_rr_tp1 != null ? Number(idea.spot_rr_tp1).toFixed(2) : "—"}x)
+              </div>
+            )
           )}
           <div className="mt-0.5 tabular-nums text-[10px] text-slate-400">
             {estShares > 0
@@ -248,21 +312,14 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
           {idea.reasons.map((r, idx) => (
             <li key={`${r.category}-${idx}`} className="flex items-start gap-2 text-xs leading-snug text-slate-300">
               <span
-                className={`mt-0.5 shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
-                  CATEGORY_COLORS[r.category] ?? "border-border bg-card text-slate-300"
-                }`}
+                className={`mt-0.5 shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${CATEGORY_COLORS[r.category] ?? "border-border bg-card text-slate-300"
+                  }`}
               >
                 {r.category}
               </span>
               <span className="min-w-0">
-                {r.detail && r.detail !== r.title ? (
-                  <>
-                    <span className="font-semibold text-white">{r.title}: </span>
-                    <span className="text-slate-300">{r.detail}</span>
-                  </>
-                ) : (
-                  <span className="font-semibold text-white">{r.title}</span>
-                )}
+                <span className="font-semibold text-white">{r.title}: </span>
+                <span className="text-slate-300">{r.detail}</span>
               </span>
             </li>
           ))}
@@ -303,11 +360,10 @@ const TradeIdeaCard: React.FC<TradeIdeaCardProps> = ({ idea, riskDollars, onOpen
               {idea.top_option.legs.map((leg, lIdx) => (
                 <span
                   key={lIdx}
-                  className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
-                    leg.action === "BUY"
-                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
-                      : "border-rose-500/30 bg-rose-500/10 text-rose-300"
-                  }`}
+                  className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${leg.action === "BUY"
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                    : "border-rose-500/30 bg-rose-500/10 text-rose-300"
+                    }`}
                 >
                   {leg.action} ${leg.strike} {leg.option_type} (@ ${leg.mid_price.toFixed(2)})
                 </span>
@@ -359,6 +415,7 @@ export const TradeIdeasView: React.FC = () => {
   const indexAlignedOnly = useScreenerStore((s) => s.ideaIndexAlignedOnly);
   const watchlistOnly = useScreenerStore((s) => s.ideaWatchlistOnly);
   const hideConflicted = useScreenerStore((s) => s.ideaHideConflicted);
+  const hideStale = useScreenerStore((s) => s.ideaHideStale);
   const settings = useScreenerStore((s) => s.settings);
   const setIdeaFilters = useScreenerStore((s) => s.setIdeaFilters);
   const fetchTradeIdeas = useScreenerStore((s) => s.fetchTradeIdeas);
@@ -373,14 +430,16 @@ export const TradeIdeasView: React.FC = () => {
   const sells = tradeIdeas?.sells ?? [];
   const totalScanned = tradeIdeas?.total_scanned ?? 0;
   const filteredConflicted = tradeIdeas?.filtered_conflicted_count ?? 0;
+  const filteredStale = tradeIdeas?.filtered_stale_count ?? 0;
+  const liveQuotesChecked = tradeIdeas?.live_quotes_checked ?? false;
   const regime = tradeIdeas?.market_regime;
 
   const regimeGuidance =
     regime?.regime === "RISK_OFF"
       ? "Market regime is RISK-OFF — Short setups align with the tape; demand extra trigger confirmation on Long buys."
       : regime?.regime === "RISK_ON"
-      ? "Market regime is RISK-ON — Favor index-aligned Long buys and keep Short setups tactical."
-      : "Market regime is NEUTRAL — Prioritize clean S/R zones, asymmetric R:R, and catalyst-free setups.";
+        ? "Market regime is RISK-ON — Favor index-aligned Long buys and keep Short setups tactical."
+        : "Market regime is NEUTRAL — Prioritize clean S/R zones, asymmetric R:R, and catalyst-free setups.";
 
   if (!tradeIdeas && loadingTradeIdeas) {
     return (
@@ -447,7 +506,15 @@ export const TradeIdeasView: React.FC = () => {
           </div>
 
           <div className="flex flex-col items-end gap-1 text-right text-[11px] text-slate-400">
-            <span>Evaluated from {totalScanned} tickers in DB</span>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {liveQuotesChecked && (
+                <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  Live IBKR Quotes Active
+                </span>
+              )}
+              <span>Evaluated from {totalScanned} tickers in DB</span>
+            </div>
             {tradeIdeas?.last_scan?.finished_at && (
               <span>Last scan: {new Date(tradeIdeas.last_scan.finished_at).toLocaleString()}</span>
             )}
@@ -474,9 +541,8 @@ export const TradeIdeasView: React.FC = () => {
                 key={opt.id}
                 type="button"
                 onClick={() => setSideFilter(opt.id)}
-                className={`rounded-md px-2.5 py-1 font-semibold transition-colors ${
-                  sideFilter === opt.id ? "bg-sky-600 text-white" : "text-slate-400 hover:text-slate-200"
-                }`}
+                className={`rounded-md px-2.5 py-1 font-semibold transition-colors ${sideFilter === opt.id ? "bg-sky-600 text-white" : "text-slate-400 hover:text-slate-200"
+                  }`}
               >
                 {opt.label}
               </button>
@@ -496,9 +562,8 @@ export const TradeIdeasView: React.FC = () => {
                 key={h.id}
                 type="button"
                 onClick={() => setIdeaFilters({ horizon: h.id })}
-                className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
-                  horizon === h.id ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"
-                }`}
+                className={`rounded-md px-2.5 py-1 font-medium transition-colors ${horizon === h.id ? "bg-slate-700 text-white" : "text-slate-400 hover:text-slate-200"
+                  }`}
               >
                 {h.label}
               </button>
@@ -534,24 +599,35 @@ export const TradeIdeasView: React.FC = () => {
           <button
             type="button"
             onClick={() => setIdeaFilters({ hideConflicted: !hideConflicted })}
-            title="Filter out setups with high-severity conflicting signals, targets crossing major barriers, or >=12% 1D gap shocks"
-            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
-              hideConflicted
-                ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
-                : "border-amber-500/50 bg-amber-500/15 text-amber-300"
-            }`}
+            title="Filter out setups with high-severity conflicting signals, targets crossing major barriers, active short-squeezes, or >=12% 1D gap shocks"
+            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${hideConflicted
+              ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+              : "border-amber-500/50 bg-amber-500/15 text-amber-300"
+              }`}
           >
             Hide Conflicted{hideConflicted && filteredConflicted > 0 ? ` (${filteredConflicted})` : ""}
           </button>
 
           <button
             type="button"
-            onClick={() => setIdeaFilters({ excludeEarnings7d: !excludeEarnings7d })}
+            onClick={() => setIdeaFilters({ hideStale: !hideStale })}
+            title="Filter out setups where live price already hit Stop-Loss or Target 1"
             className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
-              excludeEarnings7d
-                ? "border-amber-500/50 bg-amber-500/15 text-amber-300"
-                : "border-border bg-canvas text-slate-400 hover:text-slate-200"
+              hideStale
+                ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+                : "border-amber-500/50 bg-amber-500/15 text-amber-300"
             }`}
+          >
+            Hide Stale / Hit{hideStale && filteredStale > 0 ? ` (${filteredStale})` : ""}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIdeaFilters({ excludeEarnings7d: !excludeEarnings7d })}
+            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${excludeEarnings7d
+              ? "border-amber-500/50 bg-amber-500/15 text-amber-300"
+              : "border-border bg-canvas text-slate-400 hover:text-slate-200"
+              }`}
           >
             Exclude Earnings &lt;7d
           </button>
@@ -559,11 +635,10 @@ export const TradeIdeasView: React.FC = () => {
           <button
             type="button"
             onClick={() => setIdeaFilters({ indexAlignedOnly: !indexAlignedOnly })}
-            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
-              indexAlignedOnly
-                ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
-                : "border-border bg-canvas text-slate-400 hover:text-slate-200"
-            }`}
+            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${indexAlignedOnly
+              ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+              : "border-border bg-canvas text-slate-400 hover:text-slate-200"
+              }`}
           >
             Index Aligned Only
           </button>
@@ -571,11 +646,10 @@ export const TradeIdeasView: React.FC = () => {
           <button
             type="button"
             onClick={() => setIdeaFilters({ watchlistOnly: !watchlistOnly })}
-            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
-              watchlistOnly
-                ? "border-sky-500/50 bg-sky-500/15 text-sky-300"
-                : "border-border bg-canvas text-slate-400 hover:text-slate-200"
-            }`}
+            className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${watchlistOnly
+              ? "border-sky-500/50 bg-sky-500/15 text-sky-300"
+              : "border-border bg-canvas text-slate-400 hover:text-slate-200"
+              }`}
           >
             Watchlists Only
           </button>

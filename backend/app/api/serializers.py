@@ -168,16 +168,23 @@ def serialize_snapshot_detail(
 
 
 def get_latest_market_regime(session: Session) -> dict[str, Any] | None:
-    run = (
+    runs = (
         session.query(ScanRun)
         .filter(ScanRun.market_regime_json != "{}")
         .order_by(ScanRun.id.desc())
-        .first()
+        .limit(10)
+        .all()
     )
-    if not run:
-        return None
-    try:
-        data = json.loads(run.market_regime_json or "{}")
-        return data or None
-    except json.JSONDecodeError:
-        return None
+    fallback_data: dict[str, Any] | None = None
+    for run in runs:
+        try:
+            data = json.loads(run.market_regime_json or "{}")
+            if not isinstance(data, dict) or not data:
+                continue
+            if fallback_data is None:
+                fallback_data = data
+            if data.get("benchmarks"):
+                return data
+        except json.JSONDecodeError:
+            continue
+    return fallback_data

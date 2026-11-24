@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from sqlalchemy.orm import Session
 
@@ -13,8 +15,23 @@ from app.api.serializers import (
     latest_snapshot_subquery,
 )
 from app.db.models import AnalysisSnapshot, Ticker
+from app.plugins.sources.market_data_ibkr import fetch_live_quotes_batch_ibkr
 
 HorizonType = Literal["all", "short_term", "medium_term"]
+
+_LIVE_QUOTE_CACHE_LOCK = threading.Lock()
+_LIVE_QUOTE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_LIVE_QUOTE_TTL_SECONDS = 30.0
+
+_LIVE_STATUS_RANK: dict[str | None, int] = {
+    "IN_ZONE": 3,
+    "BELOW_ENTRY": 2,
+    "ABOVE_ENTRY": 2,
+    None: 2,
+    "MISSED_ENTRY": 1,
+    "TARGET_HIT": 0,
+    "STOP_HIT": -1,
+}
 
 _PLUGIN_CATEGORY_MAP: dict[str, str] = {
     "smart_money_zones": "Smart Money",
@@ -111,6 +128,75 @@ def _conviction_tier(score: float) -> str:
     return "Speculative"
 
 
+def _safe_float_val(val: Any) -> float | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_corr_60(plugin_results: dict[str, Any]) -> float | None:
+    for pid in ("correlation_rs", "rr_index_trend"):
+        pdata = plugin_results.get(pid)
+        if isinstance(pdata, dict):
+            val = _safe_float_val(pdata.get("metrics", {}).get("corr_60d", {}).get("value"))
+            if val is not None:
+                return val
+    return None
+
+
+def _extract_insider_buy_usd(plugin_results: dict[str, Any], events_insiders: dict[str, Any]) -> float:
+    ins_data = plugin_results.get("insider_activity")
+    if isinstance(ins_data, dict):
+        net_val = _safe_float_val(ins_data.get("metrics", {}).get("net_buy_usd", {}).get("value"))
+        if net_val is not None:
+            return net_val
+    trades = events_insiders.get("insiders") or []
+    return sum(
+        max(0.0, _safe_float_val(t.get("value_usd")) or 0.0)
+        for t in trades
+        if isinstance(t, dict)
+    )
+
+
+def get_cached_live_quotes_ibkr(symbols: list[str], ibkr_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Fetch batch IBKR quotes with a 30s thread-safe TTL cache (no-op if IBKR disabled)."""
+    if not ibkr_cfg.get("enabled", False) or not symbols:
+        return {}
+    unique = [s.strip().upper().replace(".", "-") for s in dict.fromkeys(symbols) if s.strip()][:40]
+    if not unique:
+        return {}
+
+    now = time.monotonic()
+    out: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    with _LIVE_QUOTE_CACHE_LOCK:
+        for sym in unique:
+            cached = _LIVE_QUOTE_CACHE.get(sym)
+            if cached and (now - cached[0]) < _LIVE_QUOTE_TTL_SECONDS:
+                out[sym] = dict(cached[1])
+            else:
+                missing.append(sym)
+
+    if missing:
+        fetched = fetch_live_quotes_batch_ibkr(
+            missing,
+            host=str(ibkr_cfg.get("host", "127.0.0.1")),
+            port=int(ibkr_cfg.get("port", 4002)),
+            client_id=int(ibkr_cfg.get("client_id", 17)),
+        )
+        if fetched:
+            stamp = time.monotonic()
+            with _LIVE_QUOTE_CACHE_LOCK:
+                for sym, quote in fetched.items():
+                    _LIVE_QUOTE_CACHE[sym] = (stamp, dict(quote))
+                    out[sym] = dict(quote)
+
+    return out
+
+
 def _compute_conviction(
     *,
     snap: AnalysisSnapshot,
@@ -121,6 +207,7 @@ def _compute_conviction(
     rr: float,
     potential_loss_pct: float,
     index_aligned: bool,
+    corr_60: float | None = None,
     days_to_earnings: int | None,
     change_pct: float,
     high_opposing_count: int,
@@ -132,6 +219,11 @@ def _compute_conviction(
     target_crosses_barrier: bool,
     stretched_zone: bool,
     has_major_conflict: bool,
+    short_pct_float: float | None = None,
+    has_insider_buy: bool = False,
+    has_rs_leader: bool = False,
+    health_grade: str | None = None,
+    debt_to_equity: float | None = None,
 ) -> float:
     short_score = float(preset_scores.get("short_term_high_rr", snap.composite_score) or snap.composite_score or 0.0)
     medium_score = float(preset_scores.get("medium_term_invest", snap.composite_score) or snap.composite_score or 0.0)
@@ -186,8 +278,39 @@ def _compute_conviction(
     stretch_penalty = -6.0 if stretched_zone else 0.0
     shock_penalty = -10.0 if abs(change_pct) >= 12.0 else 0.0
 
-    index_adj = 6.0 if index_aligned else -3.0
+    if index_aligned:
+        index_adj = 6.0
+    elif corr_60 is not None and corr_60 < 0.35:
+        index_adj = 0.0
+    else:
+        index_adj = -3.0
+
     earnings_penalty = -8.0 if days_to_earnings is not None and 0 <= days_to_earnings <= 5 else 0.0
+
+    safety_adj = 0.0
+    is_active_squeeze = bool(
+        direction == "SHORT"
+        and short_pct_float is not None
+        and short_pct_float >= 20.0
+        and change_pct >= 5.0
+    )
+    if direction == "SHORT":
+        if short_pct_float is not None:
+            if short_pct_float >= 20.0:
+                safety_adj -= 16.0
+            elif short_pct_float >= 15.0:
+                safety_adj -= 8.0
+        if health_grade in ("A+", "A") and has_rs_leader:
+            safety_adj -= 14.0
+        elif has_rs_leader:
+            safety_adj -= 8.0
+        if has_insider_buy:
+            safety_adj -= 10.0
+    else:
+        if health_grade in ("D", "F"):
+            safety_adj -= 15.0 if horizon == "medium_term" else 10.0
+        if debt_to_equity is not None and debt_to_equity >= 300.0:
+            safety_adj -= 8.0
 
     fund_adj = 0.0
     if horizon == "medium_term":
@@ -212,9 +335,12 @@ def _compute_conviction(
         + shock_penalty
         + index_adj
         + earnings_penalty
+        + safety_adj
         + fund_adj
     )
-    if has_major_conflict:
+    if is_active_squeeze:
+        conviction = min(conviction, 60.0)
+    elif has_major_conflict:
         conviction = min(conviction, 65.0)
 
     return round(max(0.0, min(100.0, conviction)), 1)
@@ -338,6 +464,7 @@ def _build_watchouts(
     signals: list[dict[str, Any]],
     risk_flags: list[dict[str, Any]],
     index_aligned: bool,
+    corr_60: float | None = None,
     days_to_earnings: int | None,
     potential_loss_pct: float,
     change_pct: float,
@@ -345,6 +472,12 @@ def _build_watchouts(
     spot_rr_tp1: float | None,
     target_crosses_barrier: bool,
     zone_pos: float | None,
+    short_pct_float: float | None = None,
+    has_insider_buy: bool = False,
+    insider_buy_usd: float = 0.0,
+    has_rs_leader: bool = False,
+    health_grade: str | None = None,
+    debt_to_equity: float | None = None,
 ) -> list[str]:
     watchouts: list[str] = []
     seen: set[str] = set()
@@ -358,7 +491,9 @@ def _build_watchouts(
     opposing_high = [
         s
         for s in signals
-        if isinstance(s, dict) and s.get("direction") == opposing_bias and s.get("severity") == "high"
+        if isinstance(s, dict)
+        and s.get("direction") == opposing_bias
+        and (s.get("severity") == "high" or (direction == "LONG" and s.get("code") == "UPPER_CHANNEL_TOUCH"))
     ]
     opposing_high.sort(
         key=lambda s: (1 if s.get("code") in _STRUCTURAL_CONFLICT_CODES else 0, float(s.get("score_impact") or 0.0)),
@@ -368,6 +503,44 @@ def _build_watchouts(
         label = str(opp.get("label") or "Opposing Level").strip()
         detail = str(opp.get("detail") or "").strip()
         add_watchout(f"Conflicting signal — {label}: {detail}" if detail else f"Conflicting signal — {label}")
+
+    if direction == "SHORT":
+        if short_pct_float is not None and short_pct_float >= 20.0:
+            if change_pct >= 5.0:
+                add_watchout(
+                    f"Active short-squeeze risk ({short_pct_float:.1f}% short float, {change_pct:+.1f}% 1D surge) — avoid shorting equity directly."
+                )
+            else:
+                add_watchout(
+                    f"High short interest ({short_pct_float:.1f}% of float) — elevated short-squeeze risk; avoid crowded equity short."
+                )
+        elif short_pct_float is not None and short_pct_float >= 15.0:
+            add_watchout(f"Elevated short interest ({short_pct_float:.1f}% of float) — monitor squeeze risk.")
+
+        if has_rs_leader:
+            if health_grade in ("A+", "A"):
+                add_watchout(
+                    f"Shorting a Grade {health_grade} RS Leader outperforming its benchmark — fighting institutional accumulation."
+                )
+            else:
+                add_watchout(
+                    "Shorting an RS Leader outperforming its benchmark — confirm trend breakdown first."
+                )
+
+        if has_insider_buy:
+            if insider_buy_usd > 0:
+                add_watchout(f"Recent open-market insider buying (${insider_buy_usd:,.0f}) opposes SHORT thesis.")
+            else:
+                add_watchout("Recent open-market insider buying opposes SHORT thesis.")
+    else:
+        if health_grade in ("D", "F"):
+            add_watchout(
+                f"Weak fundamental health (Grade {health_grade}) — speculative profitability / balance-sheet profile."
+            )
+        if debt_to_equity is not None and debt_to_equity >= 300.0:
+            add_watchout(
+                f"Extreme balance-sheet leverage (Debt/Equity {debt_to_equity:.0f}%) — heightened financing/dilution risk."
+            )
 
     if direction == "SHORT" and zone_pos is not None and zone_pos <= 20.0:
         add_watchout(
@@ -410,7 +583,7 @@ def _build_watchouts(
                 f"(${tp1:.2f}) — wait for a limit fill inside ${entry_low:.2f}-${entry_high:.2f}."
             )
 
-    if not index_aligned:
+    if not index_aligned and (corr_60 is None or corr_60 >= 0.35):
         idx_trend = str(trade_plan.get("index_trend") or "neutral").title()
         add_watchout(
             f"Counter-trend vs {ticker.primary_benchmark} ({idx_trend}) — wait for trigger confirmation and size conservatively."
@@ -440,57 +613,196 @@ def _build_watchouts(
             "Stage-1 technical snapshot — click 'Open Chart & Full Analysis' to refresh live quote, fundamentals & options."
         )
 
-    return watchouts[:6]
+    return watchouts[:7]
 
 
-def _extract_top_option(option_proposals: dict[str, Any], target_bias: str) -> dict[str, Any] | None:
+def _extract_top_option(
+    option_proposals: dict[str, Any],
+    target_bias: str,
+    *,
+    direction: Literal["LONG", "SHORT"] = "LONG",
+    spot_price: float = 0.0,
+    tp1: float = 0.0,
+    tp2: float = 0.0,
+) -> dict[str, Any] | None:
     proposals = option_proposals.get("proposals")
     if not isinstance(proposals, list):
         return None
     for prop in proposals:
-        if not isinstance(prop, dict):
+        if not isinstance(prop, dict) or prop.get("bias") != target_bias:
             continue
-        if prop.get("bias") == target_bias:
-            raw_pop = prop.get("pop_estimate")
-            pop_pct: float | None = None
-            if raw_pop is not None:
-                val = float(raw_pop)
-                norm = val * 100.0 if 0.0 < val <= 1.0 else val
-                pop_pct = round(min(99.0, max(1.0, norm)), 1)
 
-            legs_out: list[dict[str, Any]] = []
-            for leg in prop.get("legs") or []:
-                if not isinstance(leg, dict):
-                    continue
-                legs_out.append(
-                    {
-                        "action": str(leg.get("action") or ""),
-                        "option_type": str(leg.get("option_type") or ""),
-                        "strike": float(leg.get("strike") or 0.0),
-                        "mid_price": float(leg.get("mid_price") or 0.0),
-                        "delta": round(float(leg["delta"]), 3) if leg.get("delta") is not None else None,
-                    }
-                )
+        raw_pop = prop.get("pop_estimate")
+        pop_pct: float | None = None
+        if raw_pop is not None:
+            val = float(raw_pop)
+            norm = val * 100.0 if 0.0 < val <= 1.0 else val
+            pop_pct = round(norm, 1)
+            # Filter out broken delta underflows (e.g., PoP 2.1% or 99.0%)
+            if pop_pct < 10.0 or pop_pct >= 98.0:
+                continue
 
-            breakeven = [
-                round(float(b), 2) for b in (prop.get("breakeven") or []) if b is not None
-            ]
+        breakeven = [round(float(b), 2) for b in (prop.get("breakeven") or []) if b is not None]
+        net_cd = float(prop.get("net_credit_debit") or 0.0)
+        if net_cd < 0 and breakeven:
+            be = breakeven[0]
+            if direction == "LONG" and (
+                (tp2 > 0 and be >= tp2 * 0.99) or (spot_price > 0 and be > spot_price * 1.15)
+            ):
+                continue
+            if direction == "SHORT" and (
+                (tp2 > 0 and be <= tp2 * 1.01) or (spot_price > 0 and be < spot_price * 0.85)
+            ):
+                continue
 
-            return {
-                "strategy_name": str(prop.get("strategy_name") or "Option Strategy"),
-                "expiry": str(prop.get("expiry") or ""),
-                "dte": int(prop.get("dte") or 0),
-                "legs": legs_out,
-                "breakeven": breakeven,
-                "net_credit_debit": float(prop.get("net_credit_debit") or 0.0),
-                "max_profit": float(prop["max_profit"]) if prop.get("max_profit") is not None else None,
-                "max_loss": float(prop["max_loss"]) if prop.get("max_loss") is not None else None,
-                "pop_estimate": pop_pct,
-                "iv_regime": str(prop.get("iv_regime") or "normal"),
-                "rationale": str(prop.get("rationale") or ""),
-                "earnings_warning": prop.get("earnings_warning"),
-            }
+        legs_out: list[dict[str, Any]] = []
+        for leg in prop.get("legs") or []:
+            if not isinstance(leg, dict):
+                continue
+            legs_out.append(
+                {
+                    "action": str(leg.get("action") or ""),
+                    "option_type": str(leg.get("option_type") or ""),
+                    "strike": float(leg.get("strike") or 0.0),
+                    "mid_price": float(leg.get("mid_price") or 0.0),
+                    "delta": round(float(leg["delta"]), 3) if leg.get("delta") is not None else None,
+                }
+            )
+
+        return {
+            "strategy_name": str(prop.get("strategy_name") or "Option Strategy"),
+            "expiry": str(prop.get("expiry") or ""),
+            "dte": int(prop.get("dte") or 0),
+            "legs": legs_out,
+            "breakeven": breakeven,
+            "net_credit_debit": net_cd,
+            "max_profit": float(prop["max_profit"]) if prop.get("max_profit") is not None else None,
+            "max_loss": float(prop["max_loss"]) if prop.get("max_loss") is not None else None,
+            "pop_estimate": round(min(97.9, max(10.0, pop_pct)), 1) if pop_pct is not None else None,
+            "iv_regime": str(prop.get("iv_regime") or "normal"),
+            "rationale": str(prop.get("rationale") or ""),
+            "earnings_warning": prop.get("earnings_warning"),
+        }
     return None
+
+
+def apply_live_quote_to_idea(idea: dict[str, Any], quote: dict[str, Any] | None) -> dict[str, Any]:
+    """Overlay live quote drift, entry-zone status, and live R:R onto a TradeIdea dict."""
+    base_live = {
+        "live_price": None,
+        "live_change_pct": None,
+        "live_source": None,
+        "price_drift_pct": None,
+        "live_status": None,
+        "live_risk_pct": None,
+        "live_rr_tp1": None,
+        "live_rr_tp2": None,
+    }
+    if not quote:
+        idea.update(base_live)
+        return idea
+
+    live_price = _safe_float_val(quote.get("price"))
+    if live_price is None or live_price <= 0:
+        idea.update(base_live)
+        return idea
+
+    snap_price = float(idea.get("last_price") or 0.0)
+    entry_low = float(idea.get("entry_low") or 0.0)
+    entry_high = float(idea.get("entry_high") or entry_low)
+    stop_loss = float(idea.get("stop_loss") or 0.0)
+    tp1 = float(idea.get("tp1") or 0.0)
+    tp2 = float(idea.get("tp2") or 0.0)
+    direction = str(idea.get("direction") or "LONG")
+
+    drift_pct = round(((live_price - snap_price) / snap_price) * 100.0, 2) if snap_price > 0 else 0.0
+    live_chg = _safe_float_val(quote.get("change_pct"))
+
+    if direction == "LONG":
+        if stop_loss > 0 and live_price <= stop_loss:
+            status = "STOP_HIT"
+        elif tp1 > 0 and live_price >= tp1:
+            status = "TARGET_HIT"
+        elif live_price > entry_high * 1.005:
+            status = "MISSED_ENTRY"
+        elif live_price < entry_low * 0.995:
+            status = "BELOW_ENTRY"
+        else:
+            status = "IN_ZONE"
+        live_risk = live_price - stop_loss
+        rew1 = max(0.0, tp1 - live_price)
+        rew2 = max(0.0, tp2 - live_price)
+    else:
+        if stop_loss > 0 and live_price >= stop_loss:
+            status = "STOP_HIT"
+        elif tp1 > 0 and live_price <= tp1:
+            status = "TARGET_HIT"
+        elif live_price < entry_low * 0.995:
+            status = "MISSED_ENTRY"
+        elif live_price > entry_high * 1.005:
+            status = "ABOVE_ENTRY"
+        else:
+            status = "IN_ZONE"
+        live_risk = stop_loss - live_price
+        rew1 = max(0.0, live_price - tp1)
+        rew2 = max(0.0, live_price - tp2)
+
+    if live_risk > 0:
+        live_risk_pct: float | None = round((live_risk / live_price) * 100.0, 2)
+        live_rr_tp1: float | None = round(rew1 / live_risk, 2)
+        live_rr_tp2: float | None = round(rew2 / live_risk, 2)
+    else:
+        live_risk_pct = None
+        live_rr_tp1 = None
+        live_rr_tp2 = None
+
+    watchouts = list(idea.get("watchouts") or [])
+    conviction = float(idea.get("conviction_score") or 0.0)
+    prepend_msg: str | None = None
+
+    if status == "STOP_HIT":
+        prepend_msg = f"Live price (${live_price:.2f}) already breached Stop-Loss (${stop_loss:.2f}) — setup invalidated."
+        conviction = min(conviction, 40.0)
+    elif status == "TARGET_HIT":
+        prepend_msg = f"Live price (${live_price:.2f}) already reached/passed Target 1 (${tp1:.2f}) — setup is stale, do not chase."
+        conviction = min(conviction, 45.0)
+    elif status == "MISSED_ENTRY":
+        rr_str = f"{live_rr_tp1:.2f}R" if live_rr_tp1 is not None else "reduced R:R"
+        prepend_msg = (
+            f"Live price (${live_price:.2f}, {drift_pct:+.1f}% vs snapshot) moved past Entry Zone — "
+            f"live R:R to TP1 is {rr_str}; wait for pullback to limit zone."
+        )
+        if live_rr_tp1 is not None and live_rr_tp1 < 0.8:
+            conviction = max(0.0, conviction - 8.0)
+    elif status in ("BELOW_ENTRY", "ABOVE_ENTRY") and stop_loss > 0:
+        entry_mid = (entry_low + entry_high) / 2.0
+        entry_stop_dist = abs(entry_mid - stop_loss)
+        if entry_stop_dist > 0 and 0 < live_risk <= 0.45 * entry_stop_dist:
+            prepend_msg = (
+                f"Live price (${live_price:.2f}, {drift_pct:+.1f}% vs snapshot) moved close to Stop-Loss "
+                f"(${stop_loss:.2f}) — verify rejection/reversal before ordering."
+            )
+
+    if prepend_msg:
+        watchouts = [prepend_msg] + [w for w in watchouts if w != prepend_msg]
+
+    conviction = round(max(0.0, min(100.0, conviction)), 1)
+    idea.update(
+        {
+            "live_price": round(live_price, 2),
+            "live_change_pct": round(live_chg, 2) if live_chg is not None else None,
+            "live_source": str(quote.get("source") or "IBKR Gateway"),
+            "price_drift_pct": drift_pct,
+            "live_status": status,
+            "live_risk_pct": live_risk_pct,
+            "live_rr_tp1": live_rr_tp1,
+            "live_rr_tp2": live_rr_tp2,
+            "conviction_score": conviction,
+            "conviction_tier": _conviction_tier(conviction),
+            "watchouts": watchouts[:7],
+        }
+    )
+    return idea
 
 
 def build_trade_ideas(
@@ -503,6 +815,9 @@ def build_trade_ideas(
     index_aligned_only: bool = False,
     watchlist_only: bool = False,
     hide_conflicted: bool = True,
+    hide_stale: bool = True,
+    live_quotes: dict[str, dict[str, Any]] | None = None,
+    live_quote_fetcher: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     min_price: float = 5.0,
 ) -> dict[str, Any]:
     """Build advisory Buy (LONG) and Sell (SHORT) trade ideas from stored SQLite snapshots."""
@@ -547,23 +862,26 @@ def build_trade_ideas(
         if rr < min_rr:
             continue
 
-        index_aligned = bool(trade_plan.get("index_aligned", False))
-        if index_aligned_only and not index_aligned:
-            continue
-
-        events_insiders = _safe_json_loads(snap.events_insiders_json, {})
-        days_to_earnings_raw = events_insiders.get("days_to_earnings")
-        days_to_earnings = int(days_to_earnings_raw) if isinstance(days_to_earnings_raw, (int, float)) else None
-        if exclude_earnings_days is not None and days_to_earnings is not None:
-            if 0 <= days_to_earnings <= exclude_earnings_days:
-                continue
-
         preset_scores = _safe_json_loads(snap.preset_scores_json, {})
         signals = _safe_json_loads(snap.signals_json, [])
         risk_flags = _safe_json_loads(snap.risk_flags_json, [])
         plugin_results = _safe_json_loads(snap.plugin_results_json, {})
         option_proposals = _safe_json_loads(snap.option_proposals_json, {})
         fundamentals = _safe_json_loads(snap.fundamentals_json, {})
+        events_insiders = _safe_json_loads(snap.events_insiders_json, {})
+
+        corr_60 = _extract_corr_60(plugin_results)
+        index_aligned = bool(trade_plan.get("index_aligned", False))
+        if corr_60 is not None and corr_60 < 0.35:
+            index_aligned = False
+        if index_aligned_only and not index_aligned:
+            continue
+
+        days_to_earnings_raw = events_insiders.get("days_to_earnings")
+        days_to_earnings = int(days_to_earnings_raw) if isinstance(days_to_earnings_raw, (int, float)) else None
+        if exclude_earnings_days is not None and days_to_earnings is not None:
+            if 0 <= days_to_earnings <= exclude_earnings_days:
+                continue
 
         potential_gain_pct = float(trade_plan.get("potential_gain_pct") or 0.0)
         tp1_gain_pct = float(trade_plan.get("tp1_gain_pct") or 0.0)
@@ -588,8 +906,10 @@ def build_trade_ideas(
             for s in signals
             if isinstance(s, dict)
             and s.get("direction") == opposing_bias
-            and s.get("severity") == "high"
-            and s.get("code") in _STRUCTURAL_CONFLICT_CODES
+            and (
+                (s.get("severity") == "high" and s.get("code") in _STRUCTURAL_CONFLICT_CODES)
+                or (direction == "LONG" and s.get("code") == "UPPER_CHANNEL_TOUCH")
+            )
         ]
         other_high_opposing = [
             s
@@ -598,11 +918,15 @@ def build_trade_ideas(
             and s.get("direction") == opposing_bias
             and s.get("severity") == "high"
             and s.get("code") not in _STRUCTURAL_CONFLICT_CODES
+            and not (direction == "LONG" and s.get("code") == "UPPER_CHANNEL_TOUCH")
         ]
         med_opposing = [
             s
             for s in signals
-            if isinstance(s, dict) and s.get("direction") == opposing_bias and s.get("severity") == "medium"
+            if isinstance(s, dict)
+            and s.get("direction") == opposing_bias
+            and s.get("severity") == "medium"
+            and not (direction == "LONG" and s.get("code") == "UPPER_CHANNEL_TOUCH")
         ]
 
         smc_zone_raw = (
@@ -617,8 +941,41 @@ def build_trade_ideas(
             and ((direction == "SHORT" and zone_pos <= 20.0) or (direction == "LONG" and zone_pos >= 80.0))
         )
 
+        short_pct_float = _safe_float_val(fundamentals.get("short_pct_float"))
+        debt_to_equity = _safe_float_val(fundamentals.get("debt_to_equity"))
+        health_grade = fundamentals.get("health_grade") or (
+            plugin_results.get("fundamental_health", {})
+            .get("metrics", {})
+            .get("health_grade", {})
+            .get("value")
+            if isinstance(plugin_results.get("fundamental_health"), dict)
+            else None
+        )
+        insider_buy_usd = _extract_insider_buy_usd(plugin_results, events_insiders)
+        has_insider_buy = bool(
+            any(
+                isinstance(s, dict) and s.get("code") in ("INSIDER_CLUSTER_BUY", "CEO_CFO_BUY")
+                for s in signals
+            )
+            or insider_buy_usd >= 100_000.0
+        )
+        has_rs_leader = any(isinstance(s, dict) and s.get("code") == "RS_LEADER" for s in signals)
+
+        active_short_squeeze = bool(
+            direction == "SHORT"
+            and short_pct_float is not None
+            and short_pct_float >= 20.0
+            and change_pct >= 5.0
+        )
+        shorting_quality_leader = bool(direction == "SHORT" and health_grade in ("A+", "A") and has_rs_leader)
         extreme_move = abs(change_pct) >= 12.0
-        has_major_conflict = bool(structural_high_opposing or extreme_move or target_crosses_barrier)
+        has_major_conflict = bool(
+            structural_high_opposing
+            or extreme_move
+            or target_crosses_barrier
+            or active_short_squeeze
+            or shorting_quality_leader
+        )
 
         if hide_conflicted and has_major_conflict:
             filtered_conflicted_count += 1
@@ -633,6 +990,7 @@ def build_trade_ideas(
             rr=rr,
             potential_loss_pct=potential_loss_pct,
             index_aligned=index_aligned,
+            corr_60=corr_60,
             days_to_earnings=days_to_earnings,
             change_pct=change_pct,
             high_opposing_count=len(structural_high_opposing),
@@ -644,6 +1002,11 @@ def build_trade_ideas(
             target_crosses_barrier=target_crosses_barrier,
             stretched_zone=stretched_zone,
             has_major_conflict=has_major_conflict,
+            short_pct_float=short_pct_float,
+            has_insider_buy=has_insider_buy,
+            has_rs_leader=has_rs_leader,
+            health_grade=health_grade,
+            debt_to_equity=debt_to_equity,
         )
 
         action_label = "Buy" if direction == "LONG" else "Short"
@@ -667,6 +1030,7 @@ def build_trade_ideas(
             signals=signals,
             risk_flags=risk_flags,
             index_aligned=index_aligned,
+            corr_60=corr_60,
             days_to_earnings=days_to_earnings,
             potential_loss_pct=potential_loss_pct,
             change_pct=change_pct,
@@ -674,8 +1038,21 @@ def build_trade_ideas(
             spot_rr_tp1=spot_rr_tp1,
             target_crosses_barrier=target_crosses_barrier,
             zone_pos=zone_pos,
+            short_pct_float=short_pct_float,
+            has_insider_buy=has_insider_buy,
+            insider_buy_usd=insider_buy_usd,
+            has_rs_leader=has_rs_leader,
+            health_grade=health_grade,
+            debt_to_equity=debt_to_equity,
         )
-        top_option = _extract_top_option(option_proposals, target_bias)
+        top_option = _extract_top_option(
+            option_proposals,
+            target_bias,
+            direction=direction,
+            spot_price=last_price,
+            tp1=tp1,
+            tp2=tp2,
+        )
 
         thesis = (
             f"{action_label} {snap.symbol} around ${entry_low:.2f}-${entry_high:.2f} "
@@ -720,15 +1097,15 @@ def build_trade_ideas(
             "index_aligned": index_aligned,
             "index_trend": str(trade_plan.get("index_trend") or "neutral"),
             "days_to_earnings": days_to_earnings,
-            "fundamental_grade": fundamentals.get("health_grade")
-            or (
-                plugin_results.get("fundamental_health", {})
-                .get("metrics", {})
-                .get("health_grade", {})
-                .get("value")
-                if isinstance(plugin_results.get("fundamental_health"), dict)
-                else None
-            ),
+            "fundamental_grade": health_grade,
+            "live_price": None,
+            "live_change_pct": None,
+            "live_source": None,
+            "price_drift_pct": None,
+            "live_status": None,
+            "live_risk_pct": None,
+            "live_rr_tp1": None,
+            "live_rr_tp2": None,
             "reasons": reasons,
             "watchouts": watchouts,
             "top_option": top_option,
@@ -740,14 +1117,50 @@ def build_trade_ideas(
         else:
             sells.append(idea)
 
-    sort_key = lambda x: (
+    base_sort_key = lambda x: (
         x["conviction_score"],
         bool(x["index_aligned"]),
         min(float(x["risk_reward"]), 4.5),
         x["composite_score"],
     )
-    buys.sort(key=sort_key, reverse=True)
-    sells.sort(key=sort_key, reverse=True)
+    buys.sort(key=base_sort_key, reverse=True)
+    sells.sort(key=base_sort_key, reverse=True)
+
+    pool_cap = max(limit * 3, limit)
+    buy_pool = buys[:pool_cap]
+    sell_pool = sells[:pool_cap]
+
+    quotes_map = live_quotes
+    if quotes_map is None and live_quote_fetcher is not None:
+        candidate_syms = list(dict.fromkeys([x["symbol"] for x in buy_pool + sell_pool]))
+        quotes_map = live_quote_fetcher(candidate_syms) if candidate_syms else {}
+    quotes_map = quotes_map or {}
+
+    filtered_stale_count = 0
+    if quotes_map:
+        def _refine(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            nonlocal filtered_stale_count
+            refined: list[dict[str, Any]] = []
+            for item in items:
+                apply_live_quote_to_idea(item, quotes_map.get(item["symbol"]))
+                if hide_stale and item.get("live_status") in ("STOP_HIT", "TARGET_HIT"):
+                    filtered_stale_count += 1
+                    continue
+                refined.append(item)
+            refined.sort(
+                key=lambda x: (
+                    _LIVE_STATUS_RANK.get(x.get("live_status"), 2),
+                    x["conviction_score"],
+                    bool(x["index_aligned"]),
+                    min(float(x["risk_reward"]), 4.5),
+                    x["composite_score"],
+                ),
+                reverse=True,
+            )
+            return refined
+
+        buy_pool = _refine(buy_pool)
+        sell_pool = _refine(sell_pool)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -759,9 +1172,12 @@ def build_trade_ideas(
         "min_rr": min_rr,
         "hide_conflicted": hide_conflicted,
         "filtered_conflicted_count": filtered_conflicted_count,
+        "hide_stale": hide_stale,
+        "filtered_stale_count": filtered_stale_count,
+        "live_quotes_checked": bool(quotes_map),
         "market_regime": get_latest_market_regime(session),
         "last_scan": None,
         "total_scanned": len(rows),
-        "buys": buys[:limit],
-        "sells": sells[:limit],
+        "buys": buy_pool[:limit],
+        "sells": sell_pool[:limit],
     }

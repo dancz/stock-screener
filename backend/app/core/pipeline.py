@@ -171,12 +171,52 @@ def _ensure_ticker_row(
 
 def _fetch_and_store_benchmarks(session: Session, daily_period: str = "2y") -> tuple[dict[str, pd.DataFrame], MarketRegime]:
     ref_symbols = list(BENCHMARKS.keys()) + list(SECTORS.keys())
-    frames = fetch_daily_batch(ref_symbols, period=daily_period, chunk_size=20)
-    for sym, df in frames.items():
-        _ensure_ticker_row(session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym)
-        upsert_candles(session, sym, "1d", df)
-    regime = compute_market_regime(frames)
-    return frames, regime
+    cached_frames = _load_benchmarks_from_db(session)
+    fetched = fetch_daily_batch(ref_symbols, period=daily_period, chunk_size=20)
+
+    # Retry missing core benchmarks individually before falling back to local DB cache
+    missing_core = [sym for sym in BENCHMARKS.keys() if sym not in fetched or fetched[sym].empty]
+    for sym in missing_core:
+        retry_map = fetch_daily_batch([sym], period=daily_period, chunk_size=1)
+        retry_df = retry_map.get(sym)
+        if retry_df is not None and not retry_df.empty:
+            fetched[sym] = retry_df
+
+    for sym, df in fetched.items():
+        if df is not None and not df.empty:
+            _ensure_ticker_row(session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym)
+            upsert_candles(session, sym, "1d", df)
+
+    merged_frames: dict[str, pd.DataFrame] = dict(cached_frames)
+    for sym, df in fetched.items():
+        if df is not None and not df.empty:
+            merged_frames[sym] = df
+
+    fallback_syms = [
+        sym for sym in ref_symbols if (sym not in fetched or fetched[sym].empty) and sym in cached_frames
+    ]
+    if fallback_syms:
+        logger.warning("Using cached SQLite benchmark/sector candles for: %s", ", ".join(fallback_syms))
+
+    regime = compute_market_regime(merged_frames)
+    if not regime.benchmarks:
+        recent_runs = (
+            session.query(ScanRun)
+            .filter(ScanRun.market_regime_json != "{}")
+            .order_by(ScanRun.id.desc())
+            .limit(10)
+            .all()
+        )
+        for run in recent_runs:
+            try:
+                parsed = json.loads(run.market_regime_json or "{}")
+                if isinstance(parsed, dict) and parsed.get("benchmarks"):
+                    regime = MarketRegime(**parsed)
+                    break
+            except Exception:
+                continue
+
+    return merged_frames, regime
 
 
 def _load_benchmarks_from_db(session: Session) -> dict[str, pd.DataFrame]:

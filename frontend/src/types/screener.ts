@@ -3,6 +3,13 @@ export type Severity = "high" | "medium" | "low" | "warning" | "info";
 export type SortBy = "score" | "risk_reward" | "potential_gain" | "tight_entry";
 export type WatchlistHorizon = "short_term" | "medium_term" | "general";
 export type TradeIdeaHorizon = "all" | "short_term" | "medium_term";
+export type TradeIdeaLiveStatus =
+  | "IN_ZONE"
+  | "MISSED_ENTRY"
+  | "BELOW_ENTRY"
+  | "ABOVE_ENTRY"
+  | "TARGET_HIT"
+  | "STOP_HIT";
 
 export interface Signal {
   code: string;
@@ -417,6 +424,14 @@ export interface TradeIdea {
   index_trend: Bias;
   days_to_earnings: number | null;
   fundamental_grade: string | null;
+  live_price?: number | null;
+  live_change_pct?: number | null;
+  live_source?: string | null;
+  price_drift_pct?: number | null;
+  live_status?: TradeIdeaLiveStatus | null;
+  live_risk_pct?: number | null;
+  live_rr_tp1?: number | null;
+  live_rr_tp2?: number | null;
   reasons: TradeIdeaReason[];
   watchouts: string[];
   top_option: TradeIdeaOptionHint | null;
@@ -430,6 +445,9 @@ export interface TradeIdeasResponse {
   min_rr: number;
   hide_conflicted?: boolean;
   filtered_conflicted_count?: number;
+  hide_stale?: boolean;
+  filtered_stale_count?: number;
+  live_quotes_checked?: boolean;
   market_regime: MarketRegime | null;
   last_scan: ScreenerResponse["last_scan"];
   total_scanned: number;

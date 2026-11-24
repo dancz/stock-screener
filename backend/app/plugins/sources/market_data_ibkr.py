@@ -236,6 +236,79 @@ def fetch_live_quote_ibkr(
         return None
 
 
+def fetch_live_quotes_batch_ibkr(
+    symbols: list[str],
+    host: str,
+    port: int,
+    client_id: int,
+) -> dict[str, dict[str, Any]]:
+    """Read-only batch IBKR Gateway quote lookup for multiple tickers in one short session."""
+    unique = [s.strip().upper().replace(".", "-") for s in dict.fromkeys(symbols) if s.strip()][:40]
+    if not unique or not is_gateway_reachable(host, port, timeout=0.25):
+        return {}
+
+    async def _fetch_batch() -> dict[str, dict[str, Any]]:
+        from ib_async import IB, Stock
+
+        ib = IB()
+        out: dict[str, dict[str, Any]] = {}
+        try:
+            await ib.connectAsync(host, int(port), clientId=int(client_id) + 4, timeout=3.0, readonly=True)
+            ib.reqMarketDataType(3)
+            contracts = [Stock(sym, "SMART", "USD") for sym in unique]
+            qualified = await asyncio.wait_for(ib.qualifyContractsAsync(*contracts), timeout=4.0)
+            valid_contracts = [c for c in (qualified or []) if c is not None]
+            if not valid_contracts:
+                return out
+            tickers = await asyncio.wait_for(ib.reqTickersAsync(*valid_contracts), timeout=6.0)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for tk in tickers or []:
+                c = getattr(tk, "contract", None)
+                sym = str(getattr(c, "symbol", "") or "").upper()
+                if not sym:
+                    continue
+                bid = float(tk.bid) if tk.bid and math.isfinite(tk.bid) and tk.bid > 0 else None
+                ask = float(tk.ask) if tk.ask and math.isfinite(tk.ask) and tk.ask > 0 else None
+                prev_close = float(tk.close) if tk.close and math.isfinite(tk.close) and tk.close > 0 else None
+                mp = tk.marketPrice()
+                price = (
+                    float(mp)
+                    if mp and math.isfinite(mp) and mp > 0
+                    else (
+                        float(tk.last)
+                        if tk.last and math.isfinite(tk.last) and tk.last > 0
+                        else prev_close
+                    )
+                )
+                if price is None or price <= 0:
+                    continue
+                chg_pct = ((price / prev_close) - 1.0) * 100.0 if prev_close and prev_close > 0 else 0.0
+                out[sym] = {
+                    "symbol": sym,
+                    "price": round(price, 2),
+                    "previous_close": round(prev_close, 2) if prev_close else None,
+                    "change_pct": round(chg_pct, 2),
+                    "day_high": float(tk.high) if tk.high and math.isfinite(tk.high) and tk.high > 0 else None,
+                    "day_low": float(tk.low) if tk.low and math.isfinite(tk.low) and tk.low > 0 else None,
+                    "bid": round(bid, 2) if bid else None,
+                    "ask": round(ask, 2) if ask else None,
+                    "source": "IBKR Gateway",
+                    "timestamp": now_iso,
+                }
+            return out
+        except Exception as exc:
+            logger.debug("IBKR batch quote fallback (%d symbols): %s", len(unique), exc)
+            return out
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    try:
+        return _run_async(_fetch_batch())
+    except Exception:
+        return {}
+
+
 def fetch_historical_bars_ibkr(
     symbol: str,
     timeframe: Literal["1d", "1h", "1w"],

@@ -239,8 +239,19 @@ def build_trade_plan(
         stop_distance_atr = None
 
     index_trend = _compute_index_trend(benchmark_df)
-    index_aligned = (direction == "LONG" and index_trend == "bullish") or (
-        direction == "SHORT" and index_trend == "bearish"
+    corr_60: float | None = None
+    for pid in ("correlation_rs", "rr_index_trend"):
+        mod = results.get(pid)
+        if mod and "corr_60d" in mod.metrics and mod.metrics["corr_60d"].value is not None:
+            try:
+                corr_60 = float(mod.metrics["corr_60d"].value)
+                break
+            except (TypeError, ValueError):
+                pass
+    index_coupled = True if corr_60 is None else (corr_60 >= 0.35)
+    index_aligned = index_coupled and (
+        (direction == "LONG" and index_trend == "bullish")
+        or (direction == "SHORT" and index_trend == "bearish")
     )
     below_sup = [lvl for lvl in sup_candidates if lvl <= spot_price]
     above_res = [lvl for lvl in res_candidates if lvl >= spot_price]

@@ -721,3 +721,280 @@ def test_nvda_regression_fixes(tmp_path: Path):
     assert any("Extreme 1D move" in w for w in nvda["watchouts"])
     rr_r = next(r for r in nvda["reasons"] if r["category"] == "R:R & Index")
     assert f"{nvda['risk_reward']:.2f}x" in rr_r["title"]
+
+
+def test_benchmark_cache_fallback_on_empty_fetch(tmp_path: Path, monkeypatch):
+    from app.core import pipeline
+
+    db_file = tmp_path / "bench_fallback.db"
+    configure_database(db_file)
+    init_db()
+
+    closes = np.linspace(450.0, 500.0, 80)
+    cached_df = make_ohlcv_from_closes(closes)
+
+    with session_scope() as session:
+        for sym in ("SPY", "QQQ", "IWM", "^VIX"):
+            pipeline._ensure_ticker_row(session, sym, name=sym)
+            pipeline.upsert_candles(session, sym, "1d", cached_df)
+        session.commit()
+
+        # Simulate Yahoo Finance rate limit / returning empty frames
+        monkeypatch.setattr(pipeline, "fetch_daily_batch", lambda *args, **kwargs: {})
+        frames, regime = pipeline._fetch_and_store_benchmarks(session, daily_period="1y")
+
+    assert {"SPY", "QQQ", "IWM", "^VIX"}.issubset(set(frames.keys()))
+    assert [b.symbol for b in regime.benchmarks] == ["SPY", "QQQ", "IWM", "^VIX"]
+
+
+def test_trade_ideas_safety_filters_and_option_sanity(tmp_path: Path):
+    db_file = tmp_path / "safety_ideas.db"
+    configure_database(db_file)
+    init_db()
+
+    with session_scope() as session:
+        run = ScanRun(
+            mode="quick",
+            status="completed",
+            stage="completed",
+            total_tickers=5,
+            processed_tickers=5,
+            market_regime_json=json.dumps({"regime": "RISK_OFF", "benchmarks": [{"symbol": "SPY", "name": "S&P", "price": 500, "change_1d_pct": -0.5, "change_5d_pct": -1.0, "above_ema20": False, "above_ema50": False}]}),
+        )
+        session.add(run)
+        session.flush()
+
+        def _add_case(
+            *,
+            sym: str,
+            bias: str,
+            chg: float,
+            plan: dict,
+            signals: list,
+            plugins: dict,
+            fundamentals: dict,
+            options: dict,
+        ) -> None:
+            session.add(Ticker(symbol=sym, name=sym, sector="Technology", primary_benchmark="QQQ"))
+            session.flush()
+            session.add(
+                AnalysisSnapshot(
+                    scan_run_id=run.id,
+                    symbol=sym,
+                    last_price=100.0,
+                    change_pct=chg,
+                    composite_score=80.0,
+                    bias=bias,
+                    preset_scores_json=json.dumps({"all_around_swing": 80.0, "short_term_high_rr": 80.0}),
+                    signals_json=json.dumps(signals),
+                    risk_flags_json="[]",
+                    overlays_json="[]",
+                    trade_plan_json=json.dumps(plan),
+                    option_proposals_json=json.dumps(options),
+                    fundamentals_json=json.dumps(fundamentals),
+                    events_insiders_json="{}",
+                    plugin_results_json=json.dumps(plugins),
+                    is_deep_enriched=True,
+                )
+            )
+
+        # 1. GLOB-like active short squeeze (short_pct_float=26.2%, +10.7% day) -> conflicted & capped <=60
+        _add_case(
+            sym="GLOBS",
+            bias="bearish",
+            chg=10.7,
+            plan={"direction": "SHORT", "setup_name": "Supply OB", "entry_low": 99.0, "entry_high": 101.0, "stop_loss": 106.0, "tp1": 88.0, "tp2": 80.0, "risk_reward": 3.3, "index_aligned": True, "index_trend": "bearish"},
+            signals=[],
+            plugins={"correlation_rs": {"metrics": {"corr_60d": {"value": 0.55}}}, "fundamental_health": {"metrics": {"health_grade": {"value": "B"}}}},
+            fundamentals={"short_pct_float": 26.2, "health_grade": "B"},
+            options={},
+        )
+        # 2. ITT-like Grade A + RS Leader SHORT -> conflicted & watchout
+        _add_case(
+            sym="ITTS",
+            bias="bearish",
+            chg=-1.0,
+            plan={"direction": "SHORT", "setup_name": "Supply OB", "entry_low": 99.0, "entry_high": 101.0, "stop_loss": 106.0, "tp1": 88.0, "tp2": 80.0, "risk_reward": 3.3, "index_aligned": True, "index_trend": "bearish"},
+            signals=[{"code": "RS_LEADER", "label": "RS Leader vs QQQ", "direction": "bullish", "severity": "medium", "score_impact": 18.0, "detail": "Strong RS"}],
+            plugins={"correlation_rs": {"metrics": {"corr_60d": {"value": 0.45}}}, "fundamental_health": {"metrics": {"health_grade": {"value": "A"}}}},
+            fundamentals={"health_grade": "A"},
+            options={},
+        )
+        # 3. COP-like decoupled SHORT + insider buy SHORT + bad 99% PoP option
+        _add_case(
+            sym="COPC",
+            bias="bearish",
+            chg=1.5,
+            plan={"direction": "SHORT", "setup_name": "Supply Zone", "entry_low": 99.0, "entry_high": 101.0, "stop_loss": 106.0, "tp1": 90.0, "tp2": 84.0, "risk_reward": 2.6, "index_aligned": True, "index_trend": "bearish"},
+            signals=[{"code": "INSIDER_CLUSTER_BUY", "label": "Insider Cluster Buy", "direction": "bullish", "severity": "high", "score_impact": 20.0, "detail": "$565k"}],
+            plugins={
+                "correlation_rs": {"metrics": {"corr_60d": {"value": -0.27}}},
+                "insider_activity": {"metrics": {"net_buy_usd": {"value": 565000.0}}},
+            },
+            fundamentals={"health_grade": "B"},
+            options={
+                "proposals": [
+                    {
+                        "strategy_name": "Bear Call Credit Spread",
+                        "bias": "bearish",
+                        "expiry": "2027-01-15",
+                        "dte": 35,
+                        "legs": [],
+                        "breakeven": [105.0],
+                        "net_credit_debit": 1.0,
+                        "max_profit": 100.0,
+                        "max_loss": 400.0,
+                        "pop_estimate": 99.0,
+                    }
+                ]
+            },
+        )
+        # 4. ATEC-like Grade D + high leverage LONG + BE beyond TP2 bad Long Call option
+        _add_case(
+            sym="ATECL",
+            bias="bullish",
+            chg=1.2,
+            plan={"direction": "LONG", "setup_name": "Demand Bounce", "entry_low": 99.0, "entry_high": 101.0, "stop_loss": 94.0, "tp1": 108.0, "tp2": 115.0, "risk_reward": 2.5, "index_aligned": False, "index_trend": "bearish"},
+            signals=[],
+            plugins={"correlation_rs": {"metrics": {"corr_60d": {"value": 0.5}}}},
+            fundamentals={"health_grade": "D", "debt_to_equity": 2788.0},
+            options={
+                "proposals": [
+                    {
+                        "strategy_name": "Long Call",
+                        "bias": "bullish",
+                        "expiry": "2027-01-15",
+                        "dte": 35,
+                        "legs": [{"action": "BUY", "option_type": "CALL", "strike": 90.0, "mid_price": 26.0, "delta": 0.7}],
+                        "breakeven": [116.0],  # above TP2 $115!
+                        "net_credit_debit": -26.0,
+                        "max_loss": 2600.0,
+                        "pop_estimate": 55.0,
+                    }
+                ]
+            },
+        )
+        # 5. BBIO-like LONG touching Upper Channel (even with legacy medium severity) -> conflicted
+        _add_case(
+            sym="BBIOL",
+            bias="bullish",
+            chg=4.0,
+            plan={"direction": "LONG", "setup_name": "EMA Bounce", "entry_low": 99.0, "entry_high": 101.0, "stop_loss": 95.0, "tp1": 107.0, "tp2": 112.0, "risk_reward": 2.4, "index_aligned": False, "index_trend": "bearish"},
+            signals=[{"code": "UPPER_CHANNEL_TOUCH", "label": "Upper Channel Touch", "direction": "bearish", "severity": "medium", "score_impact": 20.0, "detail": "At upper rail"}],
+            plugins={},
+            fundamentals={"health_grade": "B"},
+            options={},
+        )
+
+    with session_scope() as session:
+        filtered = build_trade_ideas(session, hide_conflicted=True)
+        shown = build_trade_ideas(session, hide_conflicted=False)
+
+    assert [s["symbol"] for s in filtered["sells"]] == ["COPC"]
+    assert [b["symbol"] for b in filtered["buys"]] == ["ATECL"]
+    assert filtered["filtered_conflicted_count"] == 3  # GLOBS, ITTS, BBIOL
+
+    globs = next(s for s in shown["sells"] if s["symbol"] == "GLOBS")
+    assert globs["has_conflict"] is True
+    assert globs["conviction_score"] <= 60.0
+    assert any("Active short-squeeze risk" in w for w in globs["watchouts"])
+
+    itts = next(s for s in shown["sells"] if s["symbol"] == "ITTS")
+    assert itts["has_conflict"] is True
+    assert any("Grade A RS Leader" in w for w in itts["watchouts"])
+
+    copc = filtered["sells"][0]
+    assert copc["index_aligned"] is False  # corr_60 = -0.27 rejected false alignment
+    assert copc["top_option"] is None  # PoP 99.0% rejected
+    assert any("insider buying" in w.lower() for w in copc["watchouts"])
+
+    atecl = filtered["buys"][0]
+    assert atecl["top_option"] is None  # BE 116 >= TP2 115 rejected
+    assert any("Grade D" in w for w in atecl["watchouts"])
+    assert any("2788%" in w for w in atecl["watchouts"])
+
+
+def test_trade_ideas_live_quotes_drift_and_hide_stale(tmp_path: Path):
+    db_file = tmp_path / "live_drift.db"
+    configure_database(db_file)
+    init_db()
+
+    with session_scope() as session:
+        run = ScanRun(mode="quick", status="completed", stage="completed", total_tickers=4, processed_tickers=4)
+        session.add(run)
+        session.flush()
+        for sym, direction, elow, ehigh, sl, tp1, tp2 in [
+            ("INZONE", "LONG", 99.0, 101.0, 95.0, 108.0, 115.0),
+            ("MISSED", "LONG", 99.0, 101.0, 95.0, 108.0, 115.0),
+            ("HITTP", "LONG", 99.0, 101.0, 95.0, 108.0, 115.0),
+            ("STOPPED", "SHORT", 99.0, 101.0, 105.0, 92.0, 86.0),
+        ]:
+            session.add(Ticker(symbol=sym, name=sym, sector="Technology", primary_benchmark="QQQ"))
+            session.flush()
+            session.add(
+                AnalysisSnapshot(
+                    scan_run_id=run.id,
+                    symbol=sym,
+                    last_price=100.0,
+                    change_pct=1.0,
+                    composite_score=80.0,
+                    bias="bullish" if direction == "LONG" else "bearish",
+                    preset_scores_json=json.dumps({"all_around_swing": 80.0, "short_term_high_rr": 80.0}),
+                    signals_json="[]",
+                    risk_flags_json="[]",
+                    overlays_json="[]",
+                    trade_plan_json=json.dumps(
+                        {
+                            "direction": direction,
+                            "setup_name": "Breakout",
+                            "entry_low": elow,
+                            "entry_high": ehigh,
+                            "stop_loss": sl,
+                            "tp1": tp1,
+                            "tp2": tp2,
+                            "risk_reward": 3.0,
+                        }
+                    ),
+                    option_proposals_json="{}",
+                    fundamentals_json="{}",
+                    events_insiders_json="{}",
+                    plugin_results_json="{}",
+                    is_deep_enriched=True,
+                )
+            )
+
+    quotes = {
+        "INZONE": {"symbol": "INZONE", "price": 100.2, "change_pct": 0.5, "source": "IBKR Gateway"},
+        "MISSED": {"symbol": "MISSED", "price": 104.5, "change_pct": 4.5, "source": "IBKR Gateway"},
+        "HITTP": {"symbol": "HITTP", "price": 109.0, "change_pct": 9.0, "source": "IBKR Gateway"},
+        "STOPPED": {"symbol": "STOPPED", "price": 105.6, "change_pct": 5.6, "source": "IBKR Gateway"},
+    }
+
+    with session_scope() as session:
+        filtered = build_trade_ideas(session, live_quotes=quotes, hide_stale=True)
+        unfiltered = build_trade_ideas(session, live_quotes=quotes, hide_stale=False)
+
+    assert filtered["live_quotes_checked"] is True
+    assert filtered["filtered_stale_count"] == 2  # HITTP + STOPPED
+    assert [b["symbol"] for b in filtered["buys"]] == ["INZONE", "MISSED"]
+    assert filtered["sells"] == []
+
+    inzone, missed = filtered["buys"]
+    assert inzone["live_status"] == "IN_ZONE"
+    assert inzone["live_rr_tp2"] == round((115.0 - 100.2) / (100.2 - 95.0), 2)
+    assert missed["live_status"] == "MISSED_ENTRY"
+    assert any("moved past Entry Zone" in w for w in missed["watchouts"])
+
+    hit = next(b for b in unfiltered["buys"] if b["symbol"] == "HITTP")
+    assert hit["live_status"] == "TARGET_HIT"
+    assert hit["conviction_score"] <= 45.0
+    stopped = next(s for s in unfiltered["sells"] if s["symbol"] == "STOPPED")
+    assert stopped["live_status"] == "STOP_HIT"
+    assert stopped["conviction_score"] <= 40.0
+
+    with TestClient(app) as client:
+        api_res = client.get("/api/trade-ideas?hide_stale=false&check_live_prices=false")
+        assert api_res.status_code == 200
+        payload = api_res.json()
+        assert payload["hide_stale"] is False
+        assert payload["live_quotes_checked"] is False

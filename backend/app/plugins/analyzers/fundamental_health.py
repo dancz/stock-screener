@@ -151,6 +151,17 @@ class FundamentalHealthAnalyzer(AnalyzerPlugin):
                 )
             )
 
+        short_pct = f.get("short_pct_float")
+        if short_pct is not None and short_pct >= 15.0:
+            risk_flags.append(
+                RiskFlag(
+                    code="HIGH_SHORT_INTEREST",
+                    label=f"High Short Interest ({short_pct:.1f}%)",
+                    severity="warning",
+                    detail="Elevated short float increases short-squeeze volatility.",
+                )
+            )
+
         score = min(98.0, max(10.0, points))
         grade = _score_to_grade(score)
         bias = "bullish" if score >= 68 else ("bearish" if score <= 36 else "neutral")

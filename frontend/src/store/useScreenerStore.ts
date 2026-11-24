@@ -53,6 +53,7 @@ interface ScreenerState {
   ideaIndexAlignedOnly: boolean;
   ideaWatchlistOnly: boolean;
   ideaHideConflicted: boolean;
+  ideaHideStale: boolean;
 
   // Data
   items: ScreenerItem[];
@@ -91,6 +92,7 @@ interface ScreenerState {
       indexAlignedOnly: boolean;
       watchlistOnly: boolean;
       hideConflicted: boolean;
+      hideStale: boolean;
     }>
   ) => Promise<void>;
   openIdeaInScreener: (symbol: string) => Promise<void>;
@@ -145,6 +147,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
   ideaIndexAlignedOnly: false,
   ideaWatchlistOnly: false,
   ideaHideConflicted: true,
+  ideaHideStale: true,
 
   items: [],
   marketRegime: null,
@@ -208,6 +211,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
         indexAlignedOnly: state.ideaIndexAlignedOnly,
         watchlistOnly: state.ideaWatchlistOnly,
         hideConflicted: state.ideaHideConflicted,
+        hideStale: state.ideaHideStale,
       });
       set({ tradeIdeas: res, loadingTradeIdeas: false });
     } catch (err) {
@@ -223,6 +227,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       ...(partial.indexAlignedOnly !== undefined ? { ideaIndexAlignedOnly: partial.indexAlignedOnly } : {}),
       ...(partial.watchlistOnly !== undefined ? { ideaWatchlistOnly: partial.watchlistOnly } : {}),
       ...(partial.hideConflicted !== undefined ? { ideaHideConflicted: partial.hideConflicted } : {}),
+      ...(partial.hideStale !== undefined ? { ideaHideStale: partial.hideStale } : {}),
     });
     await get().fetchTradeIdeas();
   },

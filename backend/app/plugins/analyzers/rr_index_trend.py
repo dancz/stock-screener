@@ -14,6 +14,8 @@ from app.core.contracts import (
 )
 from app.plugins.analyzers.price_action_sr import compute_atr
 
+MIN_INDEX_CORR = 0.35
+
 
 def _trend_state(df: pd.DataFrame | None) -> str:
     if df is None or len(df) < 30:
@@ -113,9 +115,20 @@ class RRIndexTrendAnalyzer(AnalyzerPlugin):
                 if np.isfinite(c_val):
                     corr_60 = float(c_val)
 
+        index_coupled = corr_60 >= MIN_INDEX_CORR
+
         # Score both sides fairly (supporting Longs in uptrends AND Shorts in downtrends!)
-        long_edge = long_rr + (0.6 if stock_trend == "bullish" else 0.0) + (0.6 if index_trend == "bullish" else 0.0)
-        short_edge = short_rr + (0.6 if stock_trend == "bearish" else 0.0) + (0.6 if index_trend == "bearish" else 0.0)
+        # Only credit index trend alignment when the stock has meaningful positive correlation (>= 0.35).
+        long_edge = (
+            long_rr
+            + (0.6 if stock_trend == "bullish" else 0.0)
+            + (0.6 if (index_coupled and index_trend == "bullish") else 0.0)
+        )
+        short_edge = (
+            short_rr
+            + (0.6 if stock_trend == "bearish" else 0.0)
+            + (0.6 if (index_coupled and index_trend == "bearish") else 0.0)
+        )
 
         if short_edge > long_edge + 0.15 and short_rr >= 1.3:
             best_dir = "SHORT"
@@ -123,7 +136,7 @@ class RRIndexTrendAnalyzer(AnalyzerPlugin):
             best_rr = short_rr
             gain_pct = short_gain_pct
             loss_pct = short_loss_pct
-            index_match = index_trend == "bearish"
+            index_match = index_coupled and (index_trend == "bearish")
             trend_match = stock_trend == "bearish"
         else:
             best_dir = "LONG"
@@ -131,7 +144,7 @@ class RRIndexTrendAnalyzer(AnalyzerPlugin):
             best_rr = long_rr
             gain_pct = long_gain_pct
             loss_pct = long_loss_pct
-            index_match = index_trend == "bullish"
+            index_match = index_coupled and (index_trend == "bullish")
             trend_match = stock_trend == "bullish"
 
         signals: list[Signal] = []
@@ -224,11 +237,24 @@ class RRIndexTrendAnalyzer(AnalyzerPlugin):
                 formatted=f"-{loss_pct:.1f}%",
                 status="good" if loss_pct <= 4.5 else "neutral",
             ),
+            "corr_60d": MetricItem(
+                label=f"Corr ({ctx.benchmark_symbol} 60d)",
+                value=round(corr_60, 2),
+                formatted=f"{corr_60:.2f}",
+            ),
             "index_trend_match": MetricItem(
                 label=f"{ctx.benchmark_symbol} Trend Match",
                 value=index_match,
-                formatted="Aligned" if index_match else f"Counter ({index_trend})",
-                status="good" if index_match else "warn",
+                formatted=(
+                    "Aligned"
+                    if index_match
+                    else (
+                        f"Decoupled (r={corr_60:.2f})"
+                        if not index_coupled and index_trend != "neutral"
+                        else f"Counter ({index_trend})"
+                    )
+                ),
+                status="good" if index_match else ("neutral" if not index_coupled and index_trend != "neutral" else "warn"),
             ),
             "dist_to_support_pct": MetricItem(
                 label="Dist. to Support",

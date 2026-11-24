@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.core.black_scholes import bs_greeks, compute_historical_volatility, implied_volatility
+from app.core.black_scholes import bs_greeks, bs_price, compute_historical_volatility, implied_volatility
 from app.core.contracts import (
     OptionAnalysisContext,
     OptionLeg,
@@ -48,7 +48,8 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
         expiry = str(work["expiry"].iloc[0])
         T = max(dte, 1) / 365.0
 
-        # Fill missing IV and Delta analytically via Black-Scholes
+        # Fill/validate IV and Delta analytically via Black-Scholes
+        min_iv = max(0.06, hv20 * 0.25)
         ivs: list[float] = []
         deltas: list[float] = []
         for row in work.itertuples(index=False):
@@ -56,19 +57,28 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             strike = float(row.strike)
             mid = float(row.mid_price)
             raw_iv = getattr(row, "iv", None)
-            iv_val = float(raw_iv) if raw_iv is not None and pd.notna(raw_iv) and 0.01 < float(raw_iv) < 4.0 else None
+            iv_val = (
+                float(raw_iv)
+                if raw_iv is not None and pd.notna(raw_iv) and min_iv <= float(raw_iv) <= 3.5
+                else None
+            )
             if iv_val is None and mid > 0:
-                iv_val = implied_volatility(mid, spot, strike, T, option_type=opt_type)  # type: ignore[arg-type]
+                solved_iv = implied_volatility(mid, spot, strike, T, option_type=opt_type)  # type: ignore[arg-type]
+                if solved_iv is not None and 0.06 <= solved_iv <= 3.5:
+                    iv_val = solved_iv
             if iv_val is None:
                 iv_val = max(hv20, 0.20)
             ivs.append(round(iv_val, 4))
 
+            bs_delta = float(bs_greeks(spot, strike, T, sigma=iv_val, option_type=opt_type)["delta"])  # type: ignore[arg-type]
             raw_delta = getattr(row, "delta", None)
+            use_raw = False
             if raw_delta is not None and pd.notna(raw_delta) and math.isfinite(float(raw_delta)):
-                deltas.append(round(float(raw_delta), 4))
-            else:
-                g = bs_greeks(spot, strike, T, sigma=iv_val, option_type=opt_type)  # type: ignore[arg-type]
-                deltas.append(g["delta"])
+                rd = float(raw_delta)
+                collapsed = abs(rd) < 0.01 and abs(bs_delta) >= 0.01
+                if abs(rd - bs_delta) <= 0.25 and not collapsed:
+                    use_raw = True
+            deltas.append(round(float(raw_delta), 4) if use_raw else round(bs_delta, 4))
 
         work["iv"] = ivs
         work["delta"] = deltas
@@ -110,8 +120,31 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
         if ctx.days_to_earnings is not None and 0 <= ctx.days_to_earnings <= dte:
             earnings_warning = f"Expiration ({expiry}, {dte} DTE) crosses earnings in {ctx.days_to_earnings} days."
 
-        calls = work[(work["option_type"] == "CALL") & (work["mid_price"] > 0.05)].sort_values("strike")
-        puts = work[(work["option_type"] == "PUT") & (work["mid_price"] > 0.05)].sort_values("strike")
+        # Filter stale or wildly overpriced illiquid option quotes before building strategies
+        ref_iv = max(atm_iv, hv20, 0.20)
+        keep_rows: list[bool] = []
+        for row in work.itertuples(index=False):
+            mid = float(row.mid_price)
+            if mid <= 0.05 or (spot > 0 and mid > spot * 0.45):
+                keep_rows.append(False)
+                continue
+            opt_type = str(row.option_type)
+            strike = float(row.strike)
+            bid = float(getattr(row, "bid", 0.0) or 0.0)
+            ask = float(getattr(row, "ask", 0.0) or 0.0)
+            intrinsic = max(0.0, spot - strike) if opt_type == "CALL" else max(0.0, strike - spot)
+            extrinsic = max(0.0, mid - intrinsic)
+            theo = bs_price(spot, strike, T, 0.0425, ref_iv, opt_type)  # type: ignore[arg-type]
+            theo_ext = max(0.05, theo - intrinsic)
+            wide_or_one_sided = bid <= 0 or (ask > 0 and (ask - bid) / mid > 0.40)
+            if wide_or_one_sided and extrinsic > max(spot * 0.18, theo_ext * 3.0):
+                keep_rows.append(False)
+                continue
+            keep_rows.append(True)
+
+        sane = work[keep_rows]
+        calls = sane[sane["option_type"] == "CALL"].sort_values("strike")
+        puts = sane[sane["option_type"] == "PUT"].sort_values("strike")
 
         proposals: list[OptionStrategyProposal] = []
         if ctx.bias == "bullish":
@@ -211,7 +244,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             max_profit=round(credit * 100, 2),
             max_loss=round((width - credit) * 100, 2),
             breakeven=[round(float(short_row["strike"]) - credit, 2)],
-            pop_estimate=round((1.0 - short_delta) * 100, 1),
+            pop_estimate=round(min(88.0, max(15.0, (1.0 - short_delta) * 100.0)), 1),
             iv_regime=iv_regime,  # type: ignore[arg-type]
             data_source=data_source,
             earnings_warning=warn,
@@ -241,7 +274,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             max_profit=round(credit * 100, 2),
             max_loss=round((strike - credit) * 100, 2),
             breakeven=[round(strike - credit, 2)],
-            pop_estimate=round((1.0 - short_delta) * 100, 1),
+            pop_estimate=round(min(88.0, max(15.0, (1.0 - short_delta) * 100.0)), 1),
             iv_regime=iv_regime,  # type: ignore[arg-type]
             data_source=data_source,
             earnings_warning=warn,
@@ -276,7 +309,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             max_profit=round((width - debit) * 100, 2),
             max_loss=round(debit * 100, 2),
             breakeven=[round(float(long_row["strike"]) + debit, 2)],
-            pop_estimate=round(long_delta * 100 * 0.85, 1),
+            pop_estimate=round(min(75.0, max(15.0, long_delta * 100.0 * 0.85)), 1),
             iv_regime=iv_regime,  # type: ignore[arg-type]
             data_source=data_source,
             earnings_warning=warn,
@@ -313,7 +346,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             max_profit=round(credit * 100, 2),
             max_loss=round((width - credit) * 100, 2),
             breakeven=[round(float(short_row["strike"]) + credit, 2)],
-            pop_estimate=round((1.0 - short_delta) * 100, 1),
+            pop_estimate=round(min(88.0, max(15.0, (1.0 - short_delta) * 100.0)), 1),
             iv_regime=iv_regime,  # type: ignore[arg-type]
             data_source=data_source,
             earnings_warning=warn,
@@ -348,7 +381,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             max_profit=round((width - debit) * 100, 2),
             max_loss=round(debit * 100, 2),
             breakeven=[round(float(long_row["strike"]) - debit, 2)],
-            pop_estimate=round(long_delta * 100 * 0.85, 1),
+            pop_estimate=round(min(75.0, max(15.0, long_delta * 100.0 * 0.85)), 1),
             iv_regime=iv_regime,  # type: ignore[arg-type]
             data_source=data_source,
             earnings_warning=warn,
@@ -366,6 +399,8 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             return None
         strike = float(row["strike"])
         be = strike + price if opt_type == "CALL" else strike - price
+        if spot > 0 and ((opt_type == "CALL" and be > spot * 1.12) or (opt_type == "PUT" and be < spot * 0.88)):
+            return None
         return OptionStrategyProposal(
             strategy_name=f"Long {opt_type.title()} (~0.65Δ)",
             bias="bullish" if opt_type == "CALL" else "bearish",
@@ -377,7 +412,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
             max_profit=None,
             max_loss=round(price * 100, 2),
             breakeven=[round(be, 2)],
-            pop_estimate=round(abs(float(row["delta"] or 0.6)) * 100 * 0.8, 1),
+            pop_estimate=round(min(75.0, max(15.0, abs(float(row["delta"] or 0.6)) * 100.0 * 0.8)), 1),
             iv_regime=iv_regime,  # type: ignore[arg-type]
             data_source=data_source,
             earnings_warning=warn,

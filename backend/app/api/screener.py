@@ -13,7 +13,7 @@ from app.api.serializers import (
     serialize_snapshot_summary,
 )
 from app.core.registry import registry
-from app.core.trade_ideas import build_trade_ideas
+from app.core.trade_ideas import build_trade_ideas, get_cached_live_quotes_ibkr
 from app.db.database import get_db
 from app.db.models import AnalysisSnapshot, ScanRun, Ticker, WatchlistItem, load_runtime_settings
 
@@ -131,8 +131,17 @@ def get_trade_ideas(
     index_aligned_only: bool = Query(default=False),
     watchlist_only: bool = Query(default=False),
     hide_conflicted: bool = Query(default=True),
+    hide_stale: bool = Query(default=True),
+    check_live_prices: bool = Query(default=True),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    live_fetcher = None
+    if check_live_prices:
+        runtime_settings = load_runtime_settings(db)
+        ibkr_cfg = runtime_settings.get("ibkr", {})
+        if ibkr_cfg.get("enabled", False):
+            live_fetcher = lambda syms: get_cached_live_quotes_ibkr(syms, ibkr_cfg)
+
     data = build_trade_ideas(
         db,
         limit=limit,
@@ -142,6 +151,8 @@ def get_trade_ideas(
         index_aligned_only=index_aligned_only,
         watchlist_only=watchlist_only,
         hide_conflicted=hide_conflicted,
+        hide_stale=hide_stale,
+        live_quote_fetcher=live_fetcher,
     )
     data["last_scan"] = _serialize_last_scan(db)
     return data
