@@ -371,7 +371,7 @@ def test_paper_analytics_attribution_csv_and_api(tmp_path: Path):
         session.flush()
 
         for sym, sector, price in [("AAPL", "Information Technology", 200.0), ("JPM", "Financials", 180.0)]:
-            pipeline._ensure_ticker_row(session, sym, name=sym, sector=sector, primary_benchmark="SPY")
+            pipeline._ensure_ticker_row(session, sym, name=sym, sector=sector)
             session.add(
                 AnalysisSnapshot(
                     scan_run_id=run.id,
