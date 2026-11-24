@@ -54,6 +54,7 @@ interface ScreenerState {
   ideaWatchlistOnly: boolean;
   ideaHideConflicted: boolean;
   ideaHideStale: boolean;
+  ideaActionableOnly: boolean;
 
   // Data
   items: ScreenerItem[];
@@ -93,6 +94,7 @@ interface ScreenerState {
       watchlistOnly: boolean;
       hideConflicted: boolean;
       hideStale: boolean;
+      actionableOnly: boolean;
     }>
   ) => Promise<void>;
   openIdeaInScreener: (symbol: string) => Promise<void>;
@@ -148,6 +150,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
   ideaWatchlistOnly: false,
   ideaHideConflicted: true,
   ideaHideStale: true,
+  ideaActionableOnly: true,
 
   items: [],
   marketRegime: null,
@@ -207,6 +210,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
         limit: 10,
         horizon: state.ideaHorizon,
         minRr: state.ideaMinRr,
+        minConviction: state.ideaActionableOnly ? 60 : 0,
         excludeEarningsDays: state.ideaExcludeEarnings7d ? 7 : null,
         indexAlignedOnly: state.ideaIndexAlignedOnly,
         watchlistOnly: state.ideaWatchlistOnly,
@@ -228,6 +232,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       ...(partial.watchlistOnly !== undefined ? { ideaWatchlistOnly: partial.watchlistOnly } : {}),
       ...(partial.hideConflicted !== undefined ? { ideaHideConflicted: partial.hideConflicted } : {}),
       ...(partial.hideStale !== undefined ? { ideaHideStale: partial.hideStale } : {}),
+      ...(partial.actionableOnly !== undefined ? { ideaActionableOnly: partial.actionableOnly } : {}),
     });
     await get().fetchTradeIdeas();
   },

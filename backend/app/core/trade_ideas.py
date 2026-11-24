@@ -14,7 +14,7 @@ from app.api.serializers import (
     get_watchlist_membership_map,
     latest_snapshot_subquery,
 )
-from app.db.models import AnalysisSnapshot, Ticker
+from app.db.models import AnalysisSnapshot, ScanRun, Ticker
 from app.plugins.sources.market_data_ibkr import fetch_live_quotes_batch_ibkr
 
 HorizonType = Literal["all", "short_term", "medium_term"]
@@ -218,6 +218,7 @@ def _compute_conviction(
     spot_rr_tp2: float | None,
     target_crosses_barrier: bool,
     stretched_zone: bool,
+    poor_risk_geometry: bool = False,
     has_major_conflict: bool,
     short_pct_float: float | None = None,
     has_insider_buy: bool = False,
@@ -277,6 +278,7 @@ def _compute_conviction(
     barrier_penalty = -10.0 if target_crosses_barrier else 0.0
     stretch_penalty = -6.0 if stretched_zone else 0.0
     shock_penalty = -10.0 if abs(change_pct) >= 12.0 else 0.0
+    geometry_penalty = -12.0 if poor_risk_geometry else 0.0
 
     if index_aligned:
         index_adj = 6.0
@@ -285,7 +287,9 @@ def _compute_conviction(
     else:
         index_adj = -3.0
 
-    earnings_penalty = -8.0 if days_to_earnings is not None and 0 <= days_to_earnings <= 5 else 0.0
+    imminent_earnings = bool(days_to_earnings is not None and 0 <= days_to_earnings <= 2)
+    near_earnings = bool(days_to_earnings is not None and 3 <= days_to_earnings <= 5)
+    earnings_penalty = -16.0 if imminent_earnings else (-10.0 if near_earnings else 0.0)
 
     safety_adj = 0.0
     is_active_squeeze = bool(
@@ -333,15 +337,20 @@ def _compute_conviction(
         + barrier_penalty
         + stretch_penalty
         + shock_penalty
+        + geometry_penalty
         + index_adj
         + earnings_penalty
         + safety_adj
         + fund_adj
     )
-    if is_active_squeeze:
+    if imminent_earnings:
+        conviction = min(conviction, 55.0)
+    elif is_active_squeeze:
         conviction = min(conviction, 60.0)
     elif has_major_conflict:
         conviction = min(conviction, 65.0)
+    elif near_earnings:
+        conviction = min(conviction, 70.0)
 
     return round(max(0.0, min(100.0, conviction)), 1)
 
@@ -351,6 +360,7 @@ def _build_reasons(
     direction: Literal["LONG", "SHORT"],
     last_price: float,
     target_bias: str,
+    index_aligned: bool = True,
     signals: list[dict[str, Any]],
     plugin_results: dict[str, Any],
     days_to_earnings: int | None,
@@ -383,6 +393,8 @@ def _build_reasons(
         if len(reasons) >= 5:
             break
         code = str(sig.get("code") or "")
+        if code == "INDEX_TREND_ALIGNED" and not index_aligned:
+            continue
         title = str(sig.get("label") or "").strip()
         detail = str(sig.get("detail") or "").strip()
 
@@ -472,6 +484,9 @@ def _build_watchouts(
     spot_rr_tp1: float | None,
     target_crosses_barrier: bool,
     zone_pos: float | None,
+    poor_risk_geometry: bool = False,
+    is_latest_scan: bool = True,
+    snapshot_age_hours: float | None = None,
     short_pct_float: float | None = None,
     has_insider_buy: bool = False,
     insider_buy_usd: float = 0.0,
@@ -488,12 +503,20 @@ def _build_watchouts(
             watchouts.append(cleaned)
             seen.add(cleaned.lower())
 
+    suppress_codes: set[str] = set()
+    if direction == "SHORT":
+        if has_rs_leader:
+            suppress_codes.add("RS_LEADER")
+        if has_insider_buy:
+            suppress_codes.update({"INSIDER_CLUSTER_BUY", "CEO_CFO_BUY"})
+
     opposing_high = [
         s
         for s in signals
         if isinstance(s, dict)
         and s.get("direction") == opposing_bias
         and (s.get("severity") == "high" or (direction == "LONG" and s.get("code") == "UPPER_CHANNEL_TOUCH"))
+        and str(s.get("code") or "") not in suppress_codes
     ]
     opposing_high.sort(
         key=lambda s: (1 if s.get("code") in _STRUCTURAL_CONFLICT_CODES else 0, float(s.get("score_impact") or 0.0)),
@@ -541,6 +564,9 @@ def _build_watchouts(
             add_watchout(
                 f"Extreme balance-sheet leverage (Debt/Equity {debt_to_equity:.0f}%) — heightened financing/dilution risk."
             )
+
+    if poor_risk_geometry:
+        add_watchout("Wide stop-loss (>14%) with poor TP1 R:R (<0.55R) — unfavorable swing risk geometry.")
 
     if direction == "SHORT" and zone_pos is not None and zone_pos <= 20.0:
         add_watchout(
@@ -611,6 +637,10 @@ def _build_watchouts(
     if not snap.is_deep_enriched:
         add_watchout(
             "Stage-1 technical snapshot — click 'Open Chart & Full Analysis' to refresh live quote, fundamentals & options."
+        )
+    elif not is_latest_scan and snapshot_age_hours is not None and snapshot_age_hours >= 2.0:
+        add_watchout(
+            f"Snapshot from an earlier scan ({snapshot_age_hours:.1f}h ago) — open chart to refresh full analysis."
         )
 
     return watchouts[:7]
@@ -811,6 +841,7 @@ def build_trade_ideas(
     limit: int = 10,
     horizon: HorizonType = "all",
     min_rr: float = 1.5,
+    min_conviction: float = 60.0,
     exclude_earnings_days: int | None = None,
     index_aligned_only: bool = False,
     watchlist_only: bool = False,
@@ -829,10 +860,19 @@ def build_trade_ideas(
         .all()
     )
     wl_map = get_watchlist_membership_map(session)
+    latest_scan_row = (
+        session.query(ScanRun.id)
+        .filter(ScanRun.status == "completed")
+        .order_by(ScanRun.id.desc())
+        .first()
+    )
+    latest_scan_id = latest_scan_row[0] if latest_scan_row else None
+    now_utc = datetime.now(timezone.utc)
 
     buys: list[dict[str, Any]] = []
     sells: list[dict[str, Any]] = []
     filtered_conflicted_count = 0
+    filtered_low_conviction_count = 0
 
     for snap, ticker in rows:
         wl_ids = wl_map.get(snap.symbol, [])
@@ -968,6 +1008,11 @@ def build_trade_ideas(
             and change_pct >= 5.0
         )
         shorting_quality_leader = bool(direction == "SHORT" and health_grade in ("A+", "A") and has_rs_leader)
+        imminent_earnings = bool(days_to_earnings is not None and 0 <= days_to_earnings <= 2)
+        poor_risk_geometry = bool(
+            ((potential_loss_pct > 14.0) or (spot_risk_pct is not None and float(spot_risk_pct) > 14.0))
+            and (tp1_rr < 0.55 or (spot_rr_tp1 is not None and float(spot_rr_tp1) < 0.55))
+        )
         extreme_move = abs(change_pct) >= 12.0
         has_major_conflict = bool(
             structural_high_opposing
@@ -975,6 +1020,7 @@ def build_trade_ideas(
             or target_crosses_barrier
             or active_short_squeeze
             or shorting_quality_leader
+            or imminent_earnings
         )
 
         if hide_conflicted and has_major_conflict:
@@ -1001,6 +1047,7 @@ def build_trade_ideas(
             spot_rr_tp2=spot_rr_tp2,
             target_crosses_barrier=target_crosses_barrier,
             stretched_zone=stretched_zone,
+            poor_risk_geometry=poor_risk_geometry,
             has_major_conflict=has_major_conflict,
             short_pct_float=short_pct_float,
             has_insider_buy=has_insider_buy,
@@ -1009,6 +1056,18 @@ def build_trade_ideas(
             debt_to_equity=debt_to_equity,
         )
 
+        if min_conviction > 0 and hide_conflicted and not watchlist_only and conviction < min_conviction:
+            filtered_low_conviction_count += 1
+            continue
+
+        is_latest_scan = bool(
+            latest_scan_id is None or snap.scan_run_id is None or snap.scan_run_id == latest_scan_id
+        )
+        snapshot_age_hours: float | None = None
+        if snap.analyzed_at is not None:
+            snap_dt = snap.analyzed_at if snap.analyzed_at.tzinfo else snap.analyzed_at.replace(tzinfo=timezone.utc)
+            snapshot_age_hours = round(max(0.0, (now_utc - snap_dt).total_seconds() / 3600.0), 1)
+
         action_label = "Buy" if direction == "LONG" else "Short"
         setup_name = str(trade_plan.get("setup_name") or "Swing Technical Setup")
 
@@ -1016,6 +1075,7 @@ def build_trade_ideas(
             direction=direction,
             last_price=last_price,
             target_bias=target_bias,
+            index_aligned=index_aligned,
             signals=signals,
             plugin_results=plugin_results,
             days_to_earnings=days_to_earnings,
@@ -1038,6 +1098,9 @@ def build_trade_ideas(
             spot_rr_tp1=spot_rr_tp1,
             target_crosses_barrier=target_crosses_barrier,
             zone_pos=zone_pos,
+            poor_risk_geometry=poor_risk_geometry,
+            is_latest_scan=is_latest_scan,
+            snapshot_age_hours=snapshot_age_hours,
             short_pct_float=short_pct_float,
             has_insider_buy=has_insider_buy,
             insider_buy_usd=insider_buy_usd,
@@ -1068,6 +1131,9 @@ def build_trade_ideas(
             "last_price": round(last_price, 2),
             "change_pct": change_pct,
             "analyzed_at": snap.analyzed_at.isoformat() if snap.analyzed_at else None,
+            "scan_run_id": snap.scan_run_id,
+            "is_latest_scan": is_latest_scan,
+            "snapshot_age_hours": snapshot_age_hours,
             "is_deep_enriched": bool(snap.is_deep_enriched),
             "direction": direction,
             "action": "BUY" if direction == "LONG" else "SELL / SHORT",
@@ -1176,8 +1242,10 @@ def build_trade_ideas(
         ),
         "horizon": horizon,
         "min_rr": min_rr,
+        "min_conviction": min_conviction,
         "hide_conflicted": hide_conflicted,
         "filtered_conflicted_count": filtered_conflicted_count,
+        "filtered_low_conviction_count": filtered_low_conviction_count,
         "hide_stale": hide_stale,
         "filtered_stale_count": filtered_stale_count,
         "live_quotes_checked": bool(quotes_map),

@@ -127,6 +127,7 @@ def get_trade_ideas(
     limit: int = Query(default=10, ge=1, le=50),
     horizon: str = Query(default="all", pattern="^(all|short_term|medium_term)$"),
     min_rr: float = Query(default=1.5, ge=0.5, le=10.0),
+    min_conviction: float = Query(default=60.0, ge=0.0, le=95.0),
     exclude_earnings_days: int | None = Query(default=None, ge=0, le=60),
     index_aligned_only: bool = Query(default=False),
     watchlist_only: bool = Query(default=False),
@@ -147,6 +148,7 @@ def get_trade_ideas(
         limit=limit,
         horizon=horizon,  # type: ignore[arg-type]
         min_rr=min_rr,
+        min_conviction=min_conviction,
         exclude_earnings_days=exclude_earnings_days,
         index_aligned_only=index_aligned_only,
         watchlist_only=watchlist_only,

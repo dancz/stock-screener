@@ -63,6 +63,7 @@ export const api = {
     limit?: number;
     horizon?: TradeIdeaHorizon;
     minRr?: number;
+    minConviction?: number;
     excludeEarningsDays?: number | null;
     indexAlignedOnly?: boolean;
     watchlistOnly?: boolean;
@@ -73,6 +74,7 @@ export const api = {
     if (params?.limit) qs.set("limit", String(params.limit));
     if (params?.horizon) qs.set("horizon", params.horizon);
     if (params?.minRr !== undefined) qs.set("min_rr", String(params.minRr));
+    if (params?.minConviction !== undefined) qs.set("min_conviction", String(params.minConviction));
     if (params?.excludeEarningsDays !== undefined && params?.excludeEarningsDays !== null) {
       qs.set("exclude_earnings_days", String(params.excludeEarningsDays));
     }

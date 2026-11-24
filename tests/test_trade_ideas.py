@@ -525,8 +525,8 @@ def test_api_trade_ideas_filters_and_watchlist(tmp_path: Path):
         res_conf = client.get("/api/trade-ideas?hide_conflicted=false")
         assert "TSLA" in [s["symbol"] for s in res_conf.json()["sells"]]
 
-        # Lower min_rr includes LOWRR
-        res_low = client.get("/api/trade-ideas?min_rr=1.0")
+        # Lower min_rr includes LOWRR (disable min_conviction threshold to inspect low-R:R entry)
+        res_low = client.get("/api/trade-ideas?min_rr=1.0&min_conviction=0")
         assert "LOWRR" in [b["symbol"] for b in res_low.json()["buys"]]
 
         # Horizon medium_term works cleanly
@@ -1007,3 +1007,183 @@ def test_trade_ideas_live_quotes_drift_and_hide_stale(tmp_path: Path):
         payload = api_res.json()
         assert payload["hide_stale"] is False
         assert payload["live_quotes_checked"] is False
+
+
+def test_trade_ideas_imminent_earnings_threshold_freshness_and_dedup(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    db_file = tmp_path / "consistency.db"
+    configure_database(db_file)
+    init_db()
+
+    with session_scope() as session:
+        old_run = ScanRun(mode="full", status="completed", stage="completed", total_tickers=2, processed_tickers=2)
+        new_run = ScanRun(mode="full", status="completed", stage="completed", total_tickers=3, processed_tickers=3)
+        session.add_all([old_run, new_run])
+        session.flush()
+
+        # 1. DE-like setup with earnings tomorrow (dte=1) -> must be conflicted & capped <= 55
+        session.add(Ticker(symbol="DEIM", name="Deere Like", sector="Industrials", primary_benchmark="SPY"))
+        session.flush()
+        session.add(
+            AnalysisSnapshot(
+                scan_run_id=new_run.id,
+                symbol="DEIM",
+                last_price=100.0,
+                change_pct=-2.0,
+                composite_score=85.0,
+                bias="bearish",
+                preset_scores_json=json.dumps({"all_around_swing": 85.0, "short_term_high_rr": 85.0}),
+                signals_json="[]",
+                risk_flags_json="[]",
+                overlays_json="[]",
+                trade_plan_json=json.dumps(
+                    {
+                        "direction": "SHORT",
+                        "setup_name": "Breakdown",
+                        "entry_low": 99.0,
+                        "entry_high": 101.0,
+                        "stop_loss": 105.0,
+                        "tp1": 93.0,
+                        "tp2": 87.0,
+                        "risk_reward": 2.6,
+                        "index_aligned": True,
+                        "index_trend": "bearish",
+                    }
+                ),
+                option_proposals_json="{}",
+                fundamentals_json=json.dumps({"health_grade": "C"}),
+                events_insiders_json=json.dumps({"days_to_earnings": 1}),
+                plugin_results_json="{}",
+                is_deep_enriched=True,
+            )
+        )
+
+        # 2. Older-scan CRMD-like SHORT: stale INDEX_TREND_ALIGNED in signals despite corr_60=0.23, plus duplicate INSIDER_CLUSTER_BUY
+        session.add(Ticker(symbol="CRMDO", name="CorMedix Like", sector="Healthcare", primary_benchmark="SPY"))
+        session.flush()
+        session.add(
+            AnalysisSnapshot(
+                scan_run_id=old_run.id,
+                analyzed_at=datetime.now(timezone.utc) - timedelta(hours=5),
+                symbol="CRMDO",
+                last_price=10.0,
+                change_pct=3.0,
+                composite_score=74.0,
+                bias="bearish",
+                preset_scores_json=json.dumps({"all_around_swing": 74.0, "short_term_high_rr": 78.0}),
+                signals_json=json.dumps(
+                    [
+                        {
+                            "code": "INDEX_TREND_ALIGNED",
+                            "label": "Aligned w/ SPY Bearish Trend",
+                            "direction": "bearish",
+                            "severity": "medium",
+                            "score_impact": 10.0,
+                            "detail": "Old aligned signal",
+                        },
+                        {
+                            "code": "INSIDER_CLUSTER_BUY",
+                            "label": "Insider Cluster Buy (1 filings)",
+                            "direction": "bullish",
+                            "severity": "high",
+                            "score_impact": 22.0,
+                            "detail": "Open-market buy $565,295.",
+                        },
+                    ]
+                ),
+                risk_flags_json="[]",
+                overlays_json="[]",
+                trade_plan_json=json.dumps(
+                    {
+                        "direction": "SHORT",
+                        "setup_name": "Bearish FVG Supply",
+                        "entry_low": 9.8,
+                        "entry_high": 10.2,
+                        "stop_loss": 10.7,
+                        "tp1": 8.6,
+                        "tp2": 7.8,
+                        "risk_reward": 3.1,
+                        "index_aligned": True,
+                        "index_trend": "bearish",
+                    }
+                ),
+                option_proposals_json="{}",
+                fundamentals_json=json.dumps({"health_grade": "B"}),
+                events_insiders_json="{}",
+                plugin_results_json=json.dumps(
+                    {
+                        "correlation_rs": {"metrics": {"corr_60d": {"value": 0.23}}},
+                        "insider_activity": {"metrics": {"net_buy_usd": {"value": 565295.0}}},
+                    }
+                ),
+                is_deep_enriched=True,
+            )
+        )
+
+        # 3. Speculative (<60) wide-stop SHORT -> hidden by min_conviction=60.0
+        session.add(Ticker(symbol="SPECL", name="Speculative Short", sector="Materials", primary_benchmark="SPY"))
+        session.flush()
+        session.add(
+            AnalysisSnapshot(
+                scan_run_id=new_run.id,
+                symbol="SPECL",
+                last_price=50.0,
+                change_pct=-4.0,
+                composite_score=58.0,
+                bias="bearish",
+                preset_scores_json=json.dumps({"all_around_swing": 58.0, "short_term_high_rr": 58.0}),
+                signals_json="[]",
+                risk_flags_json="[]",
+                overlays_json="[]",
+                trade_plan_json=json.dumps(
+                    {
+                        "direction": "SHORT",
+                        "setup_name": "Breakdown",
+                        "entry_low": 49.5,
+                        "entry_high": 52.0,
+                        "stop_loss": 60.0,
+                        "tp1": 48.0,
+                        "tp2": 36.0,
+                        "risk_reward": 1.6,
+                        "index_aligned": True,
+                        "index_trend": "bearish",
+                    }
+                ),
+                option_proposals_json="{}",
+                fundamentals_json="{}",
+                events_insiders_json="{}",
+                plugin_results_json="{}",
+                is_deep_enriched=True,
+            )
+        )
+
+    with session_scope() as session:
+        default_res = build_trade_ideas(session, min_conviction=60.0, hide_conflicted=True)
+        all_res = build_trade_ideas(session, min_conviction=0.0, hide_conflicted=False)
+
+    assert [s["symbol"] for s in default_res["sells"]] == ["CRMDO"]
+    assert default_res["filtered_conflicted_count"] == 1  # DEIM hidden due to dte=1
+    assert default_res["filtered_low_conviction_count"] == 1  # SPECL hidden below 60
+
+    crmdo = default_res["sells"][0]
+    assert crmdo["index_aligned"] is False
+    assert all("Aligned w/ SPY" not in r["title"] for r in crmdo["reasons"])
+    insider_watchouts = [w for w in crmdo["watchouts"] if "insider" in w.lower()]
+    assert len(insider_watchouts) == 1  # deduplicated
+    assert crmdo["is_latest_scan"] is False
+    assert crmdo["snapshot_age_hours"] >= 4.5
+    assert any("earlier scan" in w.lower() for w in crmdo["watchouts"])
+
+    deim = next(s for s in all_res["sells"] if s["symbol"] == "DEIM")
+    assert deim["has_conflict"] is True
+    assert deim["conviction_score"] <= 55.0
+
+    specl = next(s for s in all_res["sells"] if s["symbol"] == "SPECL")
+    assert specl["conviction_score"] < 60.0
+    assert any("unfavorable swing risk geometry" in w.lower() for w in specl["watchouts"])
+
+    with TestClient(app) as client:
+        r_low = client.get("/api/trade-ideas?min_conviction=0&hide_conflicted=false&check_live_prices=false")
+        assert r_low.status_code == 200
+        assert len(r_low.json()["sells"]) == 3

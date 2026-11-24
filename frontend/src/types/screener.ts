@@ -394,6 +394,9 @@ export interface TradeIdea {
   last_price: number;
   change_pct: number;
   analyzed_at: string | null;
+  scan_run_id?: number | null;
+  is_latest_scan?: boolean;
+  snapshot_age_hours?: number | null;
   is_deep_enriched: boolean;
   direction: "LONG" | "SHORT";
   action: "BUY" | "SELL / SHORT";
@@ -443,8 +446,10 @@ export interface TradeIdeasResponse {
   disclaimer: string;
   horizon: TradeIdeaHorizon;
   min_rr: number;
+  min_conviction?: number;
   hide_conflicted?: boolean;
   filtered_conflicted_count?: number;
+  filtered_low_conviction_count?: number;
   hide_stale?: boolean;
   filtered_stale_count?: number;
   live_quotes_checked?: boolean;
