@@ -77,7 +77,31 @@ Spustí jediný proces na portu `8000` (`http://<ip-maliny>:8000`, bez nutnosti 
 
 ---
 
-## Nasazení na Raspberry Pi jako služba (`systemd`)
+## Nasazení na Raspberry Pi (`akcie.dantm.info`)
+
+Aplikace běží na Raspberry Pi (`ssh pi5`) pod systemd službou `stock-screener` na portu `8085` (kód v `/home/pi/src/stock-screener`, veškerá akciová data a SQLite databáze + cache na velkém disku `/media/pi/Seagate8gb/tickers`), vystavená přes existující Cloudflare Tunnel na **`https://akcie.dantm.info`**.
+
+### Rychlý redeploy z libovolného vývojového PC (přes `ssh pi5`)
+
+- **Windows (PowerShell):**
+  ```powershell
+  .\deploy.ps1
+  ```
+- **Linux / macOS:**
+  ```bash
+  bash deploy.sh
+  ```
+
+Skript překompiluje frontend (`frontend/dist`), zabalí aplikaci (bez `.venv`, `node_modules` a lokálních dočasných dat), nahraje přes `scp` na `pi5`, při změně `backend/requirements.txt` doinstaluje Python balíčky, aktualizuje `/etc/systemd/system/stock-screener.service` (auto-start po restartu včetně čekání na `/media/pi/Seagate8gb`) a ověří zdraví serveru.
+
+Volitelné přepínače:
+- `-SyncDb` / `--sync-db` — nahraje i aktuální lokální databázi `backend/data/screener.db` na `/media/pi/Seagate8gb/tickers/screener.db` a aktivuje `production` profil historie. *(Při úplně prvním deployi se DB nahraje automaticky, pokud na disku ještě neexistuje.)*
+- `-DataDir` / `--data-dir` — cílová složka pro databázi a cache na malině (výchozí `/media/pi/Seagate8gb/tickers`).
+- `-SkipBuild` / `--skip-build` — přeskočí `npm run build` a použije stávající `frontend/dist`.
+
+---
+
+## Ruční instalace na Raspberry Pi (`systemd`)
 
 1. Na Windows (nebo přímo na RPi, pokud má Node) připrav produkční build frontendu:
    ```powershell

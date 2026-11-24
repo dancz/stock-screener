@@ -1,14 +1,18 @@
 [Unit]
 Description=SwingPulse Daily US Stock Screener (FastAPI + Static SPA)
-After=network-online.target
+After=network-online.target local-fs.target
 Wants=network-online.target
+RequiresMountsFor=/media/pi/Seagate8gb
 
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/stock-screener
+WorkingDirectory=/home/pi/src/stock-screener
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/home/pi/stock-screener/backend/.venv/bin/uvicorn app.main:app --app-dir /home/pi/stock-screener/backend --host 0.0.0.0 --port 8000
+Environment="SCREENER_PORT=8085"
+Environment="SCREENER_DB_PATH=/media/pi/Seagate8gb/tickers/screener.db"
+Environment="XDG_CACHE_HOME=/media/pi/Seagate8gb/tickers/cache"
+ExecStart=/home/pi/src/stock-screener/backend/.venv/bin/uvicorn app.main:app --app-dir /home/pi/src/stock-screener/backend --host 0.0.0.0 --port 8085
 Restart=always
 RestartSec=5
 
