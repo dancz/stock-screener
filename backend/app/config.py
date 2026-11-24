@@ -184,6 +184,26 @@ def get_default_runtime_settings() -> dict[str, Any]:
                 "discord_webhook_url": "",
                 "min_alert_score": 78,
             },
+            "paper_trading": {
+                "enabled": False,
+                "mode": "virtual",
+                "auto_execute_after_scan": True,
+                "min_conviction": 68.0,
+                "min_rr": 1.8,
+                "allow_short": False,
+                "risk_per_trade_pct": 1.0,
+                "max_position_pct_equity": 15.0,
+                "max_open_positions": 6,
+                "max_positions_per_sector": 2,
+                "max_daily_new_orders": 5,
+                "min_dollar_volume": 20000000.0,
+                "max_spread_pct": 0.4,
+                "min_days_to_earnings": 7,
+                "move_to_be_at_r": 1.0,
+                "time_stop_days": 15,
+                "daily_loss_limit_pct": -2.0,
+                "max_drawdown_pct": -6.0,
+            },
         }
     )
 

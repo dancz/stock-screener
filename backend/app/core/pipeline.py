@@ -1130,6 +1130,16 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             # 5. Dispatch optional notifiers
             _dispatch_notifications(runtime_settings, deep_enriched_bundles, priority_syms, market_regime)
 
+        paper_cfg = runtime_settings.get("paper_trading", {})
+        if paper_cfg.get("enabled", False) and paper_cfg.get("auto_execute_after_scan", True):
+            try:
+                from app.core.paper_virtual import run_paper_allocation_cycle
+
+                res = run_paper_allocation_cycle(force=False)
+                logger.info("Post-scan paper allocation: %s", res)
+            except Exception as exc:
+                logger.warning("Post-scan paper allocation error: %s", exc)
+
         _update_scan_status(
             running=False,
             stage="completed",

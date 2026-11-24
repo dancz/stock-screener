@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.engine import Engine
@@ -141,6 +142,129 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class PaperAccountRun(Base):
+    __tablename__ = "paper_account_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(80), default="Experiment #1 (Virtual)")
+    mode: Mapped[str] = mapped_column(String(16), default="virtual")
+    ibkr_account: Mapped[str] = mapped_column(String(24), default="")
+    initial_capital: Mapped[float] = mapped_column(Float, default=25000.0)
+    current_equity: Mapped[float] = mapped_column(Float, default=25000.0)
+    cash_balance: Mapped[float] = mapped_column(Float, default=25000.0)
+    high_water_mark: Mapped[float] = mapped_column(Float, default=25000.0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    kill_switch_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    kill_switch_reason: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    config_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    trades: Mapped[list["PaperTrade"]] = relationship(back_populates="run", cascade="all, delete-orphan")
+    events: Mapped[list["PaperOrderEvent"]] = relationship(back_populates="run", cascade="all, delete-orphan")
+    equity_snapshots: Mapped[list["PaperEquitySnapshot"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class PaperTrade(Base):
+    __tablename__ = "paper_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("paper_account_runs.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(16), ForeignKey("tickers.symbol", ondelete="CASCADE"), index=True)
+    scan_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("scan_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    strategy_horizon: Mapped[str] = mapped_column(String(24), default="all")
+    direction: Mapped[str] = mapped_column(String(8), default="LONG")
+    setup_name: Mapped[str] = mapped_column(String(80), default="")
+    status: Mapped[str] = mapped_column(String(24), default="PENDING_ENTRY", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    planned_entry_low: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_entry_high: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_limit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_tp1: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_tp2: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_rr: Mapped[float] = mapped_column(Float, default=0.0)
+    current_stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    atr_at_entry: Mapped[float] = mapped_column(Float, default=0.0)
+    be_moved: Mapped[bool] = mapped_column(Boolean, default=False)
+    quantity_planned: Mapped[int] = mapped_column(Integer, default=0)
+    quantity_filled: Mapped[int] = mapped_column(Integer, default=0)
+    quantity_remaining: Mapped[int] = mapped_column(Integer, default=0)
+    entry_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_mark_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_slippage_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    commission_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    risk_amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    r_multiple: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_reason: Mapped[str] = mapped_column(String(32), default="")
+    ibkr_parent_order_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ibkr_stop_order_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ibkr_tp1_order_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ibkr_tp2_order_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ibkr_perm_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    conviction_at_entry: Mapped[float] = mapped_column(Float, default=0.0)
+    composite_score_at_entry: Mapped[float] = mapped_column(Float, default=0.0)
+    market_regime_at_entry: Mapped[str] = mapped_column(String(24), default="NEUTRAL")
+    sector_at_entry: Mapped[str] = mapped_column(String(64), default="")
+    signals_at_entry_json: Mapped[str] = mapped_column(Text, default="[]")
+    plugin_scores_at_entry_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    run: Mapped["PaperAccountRun"] = relationship(back_populates="trades")
+
+
+class PaperOrderEvent(Base):
+    __tablename__ = "paper_order_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("paper_account_runs.id", ondelete="CASCADE"), index=True
+    )
+    trade_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("paper_trades.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(16), default="")
+    event_type: Mapped[str] = mapped_column(String(32))
+    message: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    run: Mapped["PaperAccountRun"] = relationship(back_populates="events")
+
+
+class PaperEquitySnapshot(Base):
+    __tablename__ = "paper_equity_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("paper_account_runs.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_date: Mapped[str] = mapped_column(String(10), index=True)
+    equity: Mapped[float] = mapped_column(Float, default=0.0)
+    cash: Mapped[float] = mapped_column(Float, default=0.0)
+    open_positions_count: Mapped[int] = mapped_column(Integer, default=0)
+    realized_pnl_cum: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    drawdown_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    spy_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    run: Mapped["PaperAccountRun"] = relationship(back_populates="equity_snapshots")
+
+    __table_args__ = (UniqueConstraint("run_id", "snapshot_date", name="uq_paper_equity_run_date"),)
+
+
 def _ensure_column(engine: Engine, table_name: str, column_name: str, ddl_type: str) -> None:
     """Idempotently add missing columns to existing SQLite databases."""
     with engine.begin() as conn:
@@ -199,6 +323,33 @@ def init_db(db_session: Session | None = None) -> None:
                 session.flush()
                 for sym in wl_syms:
                     session.add(WatchlistItem(watchlist_id=wl.id, symbol=sym))
+
+        if session.query(PaperAccountRun).count() == 0:
+            eq = float(defaults.get("account", {}).get("equity", 25000.0))
+            run = PaperAccountRun(
+                name="Experiment #1 (Virtual)",
+                mode="virtual",
+                initial_capital=eq,
+                current_equity=eq,
+                cash_balance=eq,
+                high_water_mark=eq,
+                is_active=True,
+                config_snapshot_json=json.dumps(defaults.get("paper_trading", {})),
+            )
+            session.add(run)
+            session.flush()
+            session.add(
+                PaperEquitySnapshot(
+                    run_id=run.id,
+                    snapshot_date=utcnow().date().isoformat(),
+                    equity=eq,
+                    cash=eq,
+                    open_positions_count=0,
+                    realized_pnl_cum=0.0,
+                    unrealized_pnl=0.0,
+                    drawdown_pct=0.0,
+                )
+            )
 
         session.commit()
     finally:

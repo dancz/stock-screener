@@ -2,6 +2,12 @@ import type {
   BackfillStatus,
   CandleBar,
   LiveQuote,
+  PaperAccountRun,
+  PaperAttribution,
+  PaperEquityPoint,
+  PaperOrderEvent,
+  PaperOverview,
+  PaperTrade,
   PluginDescriptor,
   RuntimeSettings,
   ScanStatus,
@@ -188,5 +194,72 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ plugin_id: pluginId }),
     });
+  },
+
+  getPaperOverview(runId?: number | null): Promise<PaperOverview> {
+    const qs = runId ? `?run_id=${runId}` : "";
+    return request<PaperOverview>(`/api/paper/overview${qs}`);
+  },
+
+  getPaperEquityCurve(runId?: number | null): Promise<{ run_id: number | null; points: PaperEquityPoint[] }> {
+    const qs = runId ? `?run_id=${runId}` : "";
+    return request(`/api/paper/equity-curve${qs}`);
+  },
+
+  getPaperTrades(runId?: number | null, status?: string | null): Promise<{ run_id: number; trades: PaperTrade[] }> {
+    const params = new URLSearchParams();
+    if (runId) params.set("run_id", String(runId));
+    if (status) params.set("status", status);
+    const qs = params.toString();
+    return request(`/api/paper/trades${qs ? `?${qs}` : ""}`);
+  },
+
+  getPaperEvents(runId?: number | null): Promise<{ run_id: number; events: PaperOrderEvent[] }> {
+    const qs = runId ? `?run_id=${runId}` : "";
+    return request(`/api/paper/events${qs}`);
+  },
+
+  getPaperAttribution(runId?: number | null): Promise<PaperAttribution> {
+    const qs = runId ? `?run_id=${runId}` : "";
+    return request<PaperAttribution>(`/api/paper/attribution${qs}`);
+  },
+
+  getPaperRuns(): Promise<{ runs: PaperAccountRun[] }> {
+    return request("/api/paper/runs");
+  },
+
+  resetPaperRun(payload: { name?: string; initial_capital?: number }): Promise<PaperOverview> {
+    return request("/api/paper/runs/reset", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  evaluatePaperNow(): Promise<{
+    executed: boolean;
+    reason?: string;
+    opened?: Array<{ symbol: string; direction: string; status: string; quantity: number }>;
+    rejected?: Array<{ symbol: string; reason: string }>;
+  }> {
+    return request("/api/paper/evaluate-now", { method: "POST" });
+  },
+
+  stepPaperLifecycle(): Promise<{ step: Record<string, unknown>; overview: PaperOverview }> {
+    return request("/api/paper/step", { method: "POST" });
+  },
+
+  closePaperTrade(tradeId: number): Promise<{ trade: PaperTrade; overview: PaperOverview }> {
+    return request(`/api/paper/trades/${tradeId}/close`, { method: "POST" });
+  },
+
+  togglePaperKillSwitch(payload: { halt: boolean; reason?: string; close_all?: boolean }): Promise<PaperOverview> {
+    return request("/api/paper/kill-switch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getPaperExportCsvUrl(runId?: number | null): string {
+    return runId ? `/api/paper/trades/export.csv?run_id=${runId}` : "/api/paper/trades/export.csv";
   },
 };

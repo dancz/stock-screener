@@ -30,6 +30,26 @@ def _scheduled_full_scan() -> None:
     run_scan(mode="full")
 
 
+def _scheduled_paper_tick() -> None:
+    try:
+        from app.core.paper_virtual import step_virtual_lifecycle
+        from app.db.models import PaperTrade
+
+        with session_scope() as session:
+            runtime = load_runtime_settings(session)
+            paper_cfg = runtime.get("paper_trading", {})
+            has_active = (
+                session.query(PaperTrade)
+                .filter(PaperTrade.status.in_(("PENDING_ENTRY", "OPEN", "PARTIAL_TP1")))
+                .count()
+                > 0
+            )
+            if (paper_cfg.get("enabled", False) or has_active) and paper_cfg.get("mode", "virtual") == "virtual":
+                step_virtual_lifecycle(session, runtime_settings=runtime)
+    except Exception as exc:
+        logger.warning("Scheduled paper lifecycle tick error: %s", exc)
+
+
 def configure_scheduler(runtime_settings: dict[str, Any] | None = None) -> BackgroundScheduler:
     global _scheduler
     if runtime_settings is None:
@@ -62,6 +82,12 @@ def configure_scheduler(runtime_settings: dict[str, Any] | None = None) -> Backg
         _scheduled_full_scan,
         CronTrigger(day_of_week="mon-fri", hour=pre_h, minute=pre_m, timezone=tz),
         id="pre_market_scan",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        _scheduled_paper_tick,
+        CronTrigger(day_of_week="mon-fri", hour="14-22", minute="*/5", timezone=tz),
+        id="paper_lifecycle_job",
         replace_existing=True,
     )
 

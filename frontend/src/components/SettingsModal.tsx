@@ -17,7 +17,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
   const triggerBackfill = useScreenerStore((s) => s.triggerBackfill);
   const fetchBackfillStatus = useScreenerStore((s) => s.fetchBackfillStatus);
 
-  const [tab, setTab] = useState<"presets" | "ibkr" | "alerts">("presets");
+  const [tab, setTab] = useState<"presets" | "ibkr" | "alerts" | "paper">("presets");
   const [draft, setDraft] = useState<RuntimeSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [ibkrTestRes, setIbkrTestRes] = useState<{ connected: boolean; message: string } | null>(null);
@@ -73,6 +73,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
             { id: "presets", label: "Plugins & Presets" },
             { id: "ibkr", label: "Account, IBKR & Data" },
             { id: "alerts", label: "Schedule & Alerts" },
+            { id: "paper", label: "Paper Trading" },
           ].map((t) => (
             <button
               key={t.id}
@@ -585,6 +586,223 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
               </div>
             </div>
           )}
+
+          {tab === "paper" && (() => {
+            const p = draft.paper_trading ?? {
+              enabled: false,
+              mode: "virtual" as const,
+              auto_execute_after_scan: true,
+              min_conviction: 68.0,
+              min_rr: 1.8,
+              allow_short: false,
+              risk_per_trade_pct: 1.0,
+              max_position_pct_equity: 15.0,
+              max_open_positions: 6,
+              max_positions_per_sector: 2,
+              max_daily_new_orders: 5,
+              min_dollar_volume: 20000000,
+              max_spread_pct: 0.4,
+              min_days_to_earnings: 7,
+              move_to_be_at_r: 1.0,
+              time_stop_days: 15,
+              daily_loss_limit_pct: -2.0,
+              max_drawdown_pct: -6.0,
+            };
+            const updatePaper = (patch: Partial<typeof p>) =>
+              setDraft({ ...draft, paper_trading: { ...p, ...patch } });
+
+            return (
+              <div className="space-y-4">
+                <div className="rounded-lg border border-border bg-canvas/80 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                        Autonomous Paper Trading Mode
+                      </h3>
+                      <p className="text-[11px] text-slate-400">
+                        Phase 1 runs the local SQLite virtual simulator (read-only toward IBKR). IBKR Paper order routing arrives in Phase 2.
+                      </p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={p.enabled}
+                      onChange={(e) => updatePaper({ enabled: e.target.checked })}
+                      className="h-4 w-4 accent-sky-500"
+                    />
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Execution Mode</span>
+                      <select
+                        value={p.mode}
+                        onChange={(e) => updatePaper({ mode: e.target.value as "virtual" | "ibkr_paper" })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      >
+                        <option value="virtual">Virtual Simulator (Active)</option>
+                        <option value="ibkr_paper" disabled>
+                          IBKR Paper DU* (Phase 2)
+                        </option>
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-2 pt-5 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={p.auto_execute_after_scan}
+                        onChange={(e) => updatePaper({ auto_execute_after_scan: e.target.checked })}
+                        className="h-4 w-4 accent-sky-500"
+                      />
+                      Auto-allocate after scans
+                    </label>
+                    <label className="flex items-center gap-2 pt-5 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={p.allow_short}
+                        onChange={(e) => updatePaper({ allow_short: e.target.checked })}
+                        className="h-4 w-4 accent-sky-500"
+                      />
+                      Allow Short setups
+                    </label>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border bg-canvas/80 p-4 space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Entry Filters &amp; Position Sizing
+                  </h3>
+                  <div className="grid grid-cols-3 gap-3">
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Min Conviction (0-100)</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.min_conviction}
+                        onChange={(e) => updatePaper({ min_conviction: Number(e.target.value) || 0 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Min Reward:Risk</span>
+                      <input
+                        type="number"
+                        step={0.1}
+                        value={p.min_rr}
+                        onChange={(e) => updatePaper({ min_rr: Number(e.target.value) || 1.0 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Risk per Trade (%)</span>
+                      <input
+                        type="number"
+                        step={0.25}
+                        value={p.risk_per_trade_pct}
+                        onChange={(e) => updatePaper({ risk_per_trade_pct: Number(e.target.value) || 1.0 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Max Position (% Equity)</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.max_position_pct_equity}
+                        onChange={(e) => updatePaper({ max_position_pct_equity: Number(e.target.value) || 15 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Max Open Positions</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.max_open_positions}
+                        onChange={(e) => updatePaper({ max_open_positions: Number(e.target.value) || 6 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Max per Sector</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.max_positions_per_sector}
+                        onChange={(e) => updatePaper({ max_positions_per_sector: Number(e.target.value) || 2 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-border bg-canvas/80 p-4 space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Lifecycle &amp; Kill-Switch Safeguards
+                  </h3>
+                  <div className="grid grid-cols-3 gap-3">
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Min Days to Earnings</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.min_days_to_earnings}
+                        onChange={(e) => updatePaper({ min_days_to_earnings: Number(e.target.value) || 7 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Move SL to BE at R</span>
+                      <input
+                        type="number"
+                        step={0.1}
+                        value={p.move_to_be_at_r}
+                        onChange={(e) => updatePaper({ move_to_be_at_r: Number(e.target.value) || 1.0 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Time Stop (Business Days)</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.time_stop_days}
+                        onChange={(e) => updatePaper({ time_stop_days: Number(e.target.value) || 15 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Daily Loss Limit (%)</span>
+                      <input
+                        type="number"
+                        step={0.5}
+                        value={p.daily_loss_limit_pct}
+                        onChange={(e) => updatePaper({ daily_loss_limit_pct: Number(e.target.value) })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Max Drawdown Kill-Switch (%)</span>
+                      <input
+                        type="number"
+                        step={0.5}
+                        value={p.max_drawdown_pct}
+                        onChange={(e) => updatePaper({ max_drawdown_pct: Number(e.target.value) })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Max Daily New Orders</span>
+                      <input
+                        type="number"
+                        step={1}
+                        value={p.max_daily_new_orders}
+                        onChange={(e) => updatePaper({ max_daily_new_orders: Number(e.target.value) || 5 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         {/* Footer */}

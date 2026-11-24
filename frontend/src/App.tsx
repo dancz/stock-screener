@@ -7,6 +7,7 @@ import { FundamentalsCard } from "./components/FundamentalsCard";
 import { LeftSidebar } from "./components/LeftSidebar";
 import { NotesTagsCard } from "./components/NotesTagsCard";
 import { OptionsCard } from "./components/OptionsCard";
+import { PaperTradingView } from "./components/PaperTradingView";
 import { ScoreBreakdownCard } from "./components/ScoreBreakdownCard";
 import { SettingsModal } from "./components/SettingsModal";
 import { StockChart } from "./components/StockChart";
@@ -56,6 +57,19 @@ export function App() {
             )}
             <ErrorBoundary resetKey="trade_ideas">
               <TradeIdeasView />
+            </ErrorBoundary>
+          </main>
+        </div>
+      ) : activeView === "paper_trading" ? (
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <main className="flex-1 overflow-y-auto p-4">
+            {error && (
+              <div className="mb-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs text-rose-300">
+                {error}
+              </div>
+            )}
+            <ErrorBoundary resetKey="paper_trading">
+              <PaperTradingView />
             </ErrorBoundary>
           </main>
         </div>

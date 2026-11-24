@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import scan, screener, settings as settings_api, stocks, watchlists
+from app.api import paper_trading, scan, screener, settings as settings_api, stocks, watchlists
 from app.config import FRONTEND_DIST_DIR
 from app.core.registry import registry
 from app.core.request_queue import shutdown_queues
@@ -63,6 +63,7 @@ def create_app() -> FastAPI:
     app.include_router(watchlists.router, prefix="/api")
     app.include_router(scan.router, prefix="/api")
     app.include_router(settings_api.router, prefix="/api")
+    app.include_router(paper_trading.router, prefix="/api")
 
     # Single-process production serving of built React frontend (for Raspberry Pi & local prod)
     dist_dir = Path(FRONTEND_DIST_DIR)

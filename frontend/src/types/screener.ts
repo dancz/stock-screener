@@ -1,4 +1,5 @@
 export type Bias = "bullish" | "bearish" | "neutral";
+export type ActiveView = "screener" | "trade_ideas" | "paper_trading";
 export type Severity = "high" | "medium" | "low" | "warning" | "info";
 export type SortBy = "score" | "risk_reward" | "potential_gain" | "tight_entry";
 export type WatchlistHorizon = "short_term" | "medium_term" | "general";
@@ -327,6 +328,27 @@ export interface PluginDescriptor {
   enabled: boolean;
 }
 
+export interface PaperTradingSettings {
+  enabled: boolean;
+  mode: "virtual" | "ibkr_paper";
+  auto_execute_after_scan: boolean;
+  min_conviction: number;
+  min_rr: number;
+  allow_short: boolean;
+  risk_per_trade_pct: number;
+  max_position_pct_equity: number;
+  max_open_positions: number;
+  max_positions_per_sector: number;
+  max_daily_new_orders: number;
+  min_dollar_volume: number;
+  max_spread_pct: number;
+  min_days_to_earnings: number;
+  move_to_be_at_r: number;
+  time_stop_days: number;
+  daily_loss_limit_pct: number;
+  max_drawdown_pct: number;
+}
+
 export interface RuntimeSettings {
   presets: Record<string, { name: string; description: string; weights: Record<string, number> }>;
   enabled_plugins: Record<string, boolean>;
@@ -355,6 +377,143 @@ export interface RuntimeSettings {
     discord_webhook_url: string;
     min_alert_score: number;
   };
+  paper_trading?: PaperTradingSettings;
+}
+
+export interface PaperAccountRun {
+  id: number;
+  name: string;
+  mode: "virtual" | "ibkr_paper" | string;
+  ibkr_account?: string;
+  initial_capital: number;
+  current_equity: number;
+  cash_balance?: number;
+  high_water_mark?: number;
+  is_active: boolean;
+  kill_switch_triggered: boolean;
+  kill_switch_reason?: string;
+  started_at: string | null;
+  ended_at: string | null;
+}
+
+export interface PaperKpis {
+  total_return_usd: number;
+  total_return_pct: number;
+  spy_return_pct: number | null;
+  alpha_vs_spy_pct: number | null;
+  realized_pnl_usd: number;
+  unrealized_pnl_usd: number;
+  open_count: number;
+  pending_count: number;
+  closed_count: number;
+  wins_count: number;
+  losses_count: number;
+  win_rate_pct: number;
+  profit_factor: number | null;
+  expectancy_r: number;
+  expectancy_usd: number;
+  avg_win_usd: number;
+  avg_loss_usd: number;
+  avg_win_r: number;
+  avg_loss_r: number;
+  largest_win_usd: number;
+  largest_loss_usd: number;
+  max_drawdown_pct: number;
+  current_drawdown_pct: number;
+  sharpe_ratio: number | null;
+  avg_hold_days: number;
+  avg_slippage_bps: number | null;
+  fill_rate_pct: number | null;
+}
+
+export interface PaperOverview {
+  run: PaperAccountRun;
+  paper_settings: PaperTradingSettings;
+  kpis: PaperKpis;
+}
+
+export interface PaperEquityPoint {
+  date: string;
+  equity: number;
+  cash: number;
+  drawdown_pct: number;
+  open_positions_count: number;
+  realized_pnl_cum: number;
+  unrealized_pnl: number;
+  spy_equity: number | null;
+}
+
+export interface PaperTrade {
+  id: number;
+  run_id: number;
+  symbol: string;
+  scan_run_id: number | null;
+  direction: "LONG" | "SHORT";
+  setup_name: string;
+  status: string;
+  created_at: string | null;
+  submitted_at: string | null;
+  filled_at: string | null;
+  closed_at: string | null;
+  planned_entry_low: number;
+  planned_entry_high: number;
+  planned_limit_price: number;
+  planned_stop_loss: number;
+  current_stop_loss: number;
+  planned_tp1: number;
+  planned_tp2: number;
+  planned_rr: number;
+  be_moved: boolean;
+  quantity_planned: number;
+  quantity_filled: number;
+  quantity_remaining: number;
+  entry_fill_price: number | null;
+  exit_fill_price: number | null;
+  last_mark_price: number | null;
+  entry_slippage_bps: number | null;
+  commission_usd: number;
+  risk_amount_usd: number;
+  realized_pnl_usd: number;
+  realized_pnl_pct: number;
+  unrealized_pnl_usd: number;
+  r_multiple: number;
+  exit_reason: string;
+  conviction_at_entry: number;
+  composite_score_at_entry: number;
+  market_regime_at_entry: string;
+  sector_at_entry: string;
+  signals_at_entry: string[];
+}
+
+export interface PaperOrderEvent {
+  id: number;
+  run_id: number;
+  trade_id: number | null;
+  symbol: string;
+  event_type: string;
+  message: string;
+  created_at: string | null;
+}
+
+export interface PaperAttributionBucket {
+  key: string;
+  trades: number;
+  wins: number;
+  win_rate_pct: number;
+  avg_r: number;
+  total_pnl_usd: number;
+  profit_factor: number | null;
+}
+
+export interface PaperAttribution {
+  run_id: number;
+  closed_trades: number;
+  by_signal: PaperAttributionBucket[];
+  by_conviction_band: PaperAttributionBucket[];
+  by_direction: PaperAttributionBucket[];
+  by_regime: PaperAttributionBucket[];
+  by_sector: PaperAttributionBucket[];
+  by_exit_reason: PaperAttributionBucket[];
 }
 
 export interface TradeIdeaReason {

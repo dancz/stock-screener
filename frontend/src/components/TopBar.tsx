@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import {
   Activity,
   BarChart3,
+  Briefcase,
   ChevronDown,
   Lightbulb,
   Loader2,
@@ -24,6 +25,7 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenSettings }) => {
   const activeView = useScreenerStore((s) => s.activeView);
   const setActiveView = useScreenerStore((s) => s.setActiveView);
   const tradeIdeas = useScreenerStore((s) => s.tradeIdeas);
+  const paperOpenCount = useScreenerStore((s) => s.paperOpenCount);
   const marketRegime = useScreenerStore((s) => s.marketRegime);
   const scanStatus = useScreenerStore((s) => s.scanStatus);
   const ibkrStatus = useScreenerStore((s) => s.ibkrStatus);
@@ -106,6 +108,29 @@ export const TopBar: React.FC<TopBarProps> = ({ onOpenSettings }) => {
                 }`}
               >
                 {ideasCount}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveView("paper_trading")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+              activeView === "paper_trading"
+                ? "bg-sky-600 text-white shadow-sm"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            <Briefcase className="h-3.5 w-3.5" />
+            <span>Paper Trading</span>
+            {paperOpenCount > 0 && (
+              <span
+                className={`rounded-full px-1.5 py-0 text-[10px] font-bold tabular-nums ${
+                  activeView === "paper_trading"
+                    ? "bg-white/20 text-white"
+                    : "bg-emerald-500/20 text-emerald-300"
+                }`}
+              >
+                {paperOpenCount}
               </span>
             )}
           </button>

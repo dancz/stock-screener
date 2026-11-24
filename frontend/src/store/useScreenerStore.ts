@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api } from "../api/client";
 import type {
+  ActiveView,
   BackfillStatus,
   CandleBar,
   LiveQuote,
@@ -32,7 +33,7 @@ export interface LayerVisibility {
 
 interface ScreenerState {
   // Navigation & Filters
-  activeView: "screener" | "trade_ideas";
+  activeView: ActiveView;
   sidebarTab: "screener" | "watchlists";
   activePreset: string;
   sortBy: SortBy;
@@ -74,6 +75,7 @@ interface ScreenerState {
   settings: RuntimeSettings | null;
   plugins: PluginDescriptor[];
   ibkrStatus: { connected: boolean; message: string } | null;
+  paperOpenCount: number;
 
   // Loading & Errors
   loadingList: boolean;
@@ -83,7 +85,8 @@ interface ScreenerState {
 
   // Actions
   init: () => Promise<void>;
-  setActiveView: (view: "screener" | "trade_ideas") => void;
+  setActiveView: (view: ActiveView) => void;
+  refreshPaperSummary: () => Promise<void>;
   fetchTradeIdeas: () => Promise<void>;
   setIdeaFilters: (
     partial: Partial<{
@@ -177,6 +180,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
   settings: null,
   plugins: [],
   ibkrStatus: null,
+  paperOpenCount: 0,
 
   loadingList: false,
   loadingDetail: false,
@@ -189,6 +193,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       get().fetchWatchlists(),
       get().fetchScreener(),
       get().fetchTradeIdeas(),
+      get().refreshPaperSummary(),
       get().pollScanStatus(),
       get().fetchBackfillStatus(),
     ]);
@@ -199,6 +204,17 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
     set({ activeView: view });
     if (view === "trade_ideas") {
       get().fetchTradeIdeas();
+    } else if (view === "paper_trading") {
+      get().refreshPaperSummary();
+    }
+  },
+
+  async refreshPaperSummary() {
+    try {
+      const ov = await api.getPaperOverview();
+      set({ paperOpenCount: (ov.kpis.open_count ?? 0) + (ov.kpis.pending_count ?? 0) });
+    } catch {
+      // ignore if paper endpoint unavailable
     }
   },
 
@@ -520,7 +536,7 @@ export const useScreenerStore = create<ScreenerState>((set, get) => ({
       const status = await api.getScanStatus();
       set({ scanStatus: status });
       if (prevRunning && !status.running && status.stage === "completed") {
-        await Promise.all([get().fetchScreener(), get().fetchTradeIdeas()]);
+        await Promise.all([get().fetchScreener(), get().fetchTradeIdeas(), get().refreshPaperSummary()]);
         const sel = get().selectedSymbol;
         if (sel) await get().selectStock(sel);
       }
