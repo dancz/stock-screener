@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from app.core import pipeline
-from app.core.request_queue import Priority, PriorityRequestQueue, SlidingWindowLimiter
+from app.core.request_queue import IbkrSessionWorker, Priority, PriorityRequestQueue, SlidingWindowLimiter
 from app.db.database import configure_database, session_scope
 from app.db.models import init_db
 
@@ -180,3 +180,44 @@ def test_queue_stats_exposed_in_scan_status():
     assert "limiter" in queues["yahoo"]
     assert "hmds_limiter" in queues["ibkr"]
     assert "live_limiter" in queues["ibkr"]
+    assert "hmds_circuit_open" in queues["ibkr"]
+
+
+def test_ibkr_hmds_circuit_breaker_opens_and_skips_fast():
+    import time
+
+    worker = IbkrSessionWorker(hmds_cooldown_s=60.0)
+    try:
+        assert worker.is_hmds_circuit_open() is False
+        worker.handle_ib_error(-1, 2105, "HMDS data farm connection is broken:ushmds")
+        assert worker.stats()["hmds_farm_broken"] is True
+
+        # Single HMDS failure when ushmds is broken trips the circuit breaker immediately
+        worker.record_hmds_outcome(False)
+        assert worker.is_hmds_circuit_open() is True
+
+        async def _never_runs(_ib):  # pragma: no cover
+            raise AssertionError("Should skip without connecting while circuit is open")
+
+        t0 = time.monotonic()
+        res = worker.run(
+            _never_runs,
+            host="127.0.0.1",
+            port=4002,
+            client_id=17,
+            is_hmds=True,
+            dedup_key="cb-test",
+        )
+        elapsed = time.monotonic() - t0
+        assert res is None
+        assert elapsed < 0.5
+        st = worker.stats()
+        assert st["hmds_circuit_skips"] == 1
+        assert st["hmds_limiter"]["used_in_window"] == 0
+
+        # Gateway recovery (2106) resets circuit cleanly
+        worker.handle_ib_error(-1, 2106, "HMDS data farm connection is OK:ushmds")
+        assert worker.is_hmds_circuit_open() is False
+        assert worker.stats()["hmds_farm_broken"] is False
+    finally:
+        worker.shutdown()

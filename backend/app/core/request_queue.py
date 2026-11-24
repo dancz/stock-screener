@@ -239,9 +239,11 @@ class IbkrSessionWorker:
         *,
         client_id_offset: int = 5,
         idle_timeout_s: float = 120.0,
+        hmds_cooldown_s: float = 300.0,
     ) -> None:
         self.client_id_offset = int(client_id_offset)
         self.idle_timeout_s = float(idle_timeout_s)
+        self.hmds_cooldown_s = float(hmds_cooldown_s)
         self.hmds_limiter = SlidingWindowLimiter(max_calls=50, window_seconds=600.0, min_interval=1.2)
         self.live_limiter = SlidingWindowLimiter(max_calls=120, window_seconds=60.0, min_interval=0.15)
         self._pq: queue.PriorityQueue[tuple[int, int, _IbkrJob | None]] = queue.PriorityQueue()
@@ -256,6 +258,48 @@ class IbkrSessionWorker:
         self._dedup_hits = 0
         self._errors = 0
         self._hmds_budget_skips = 0
+        self._hmds_consecutive_failures = 0
+        self._hmds_cooldown_until = 0.0
+        self._hmds_circuit_skips = 0
+        self._hmds_farm_broken = False
+
+    def is_hmds_circuit_open(self) -> bool:
+        with self._lock:
+            return time.monotonic() < self._hmds_cooldown_until
+
+    def record_hmds_outcome(self, success: bool) -> None:
+        with self._lock:
+            if success:
+                self._hmds_consecutive_failures = 0
+                self._hmds_farm_broken = False
+                self._hmds_cooldown_until = 0.0
+                return
+            self._hmds_consecutive_failures += 1
+            threshold = 1 if self._hmds_farm_broken else 2
+            if self._hmds_consecutive_failures >= threshold:
+                self._hmds_cooldown_until = time.monotonic() + self.hmds_cooldown_s
+                logger.warning(
+                    "IBKR HMDS circuit breaker opened for %.0fs (failures=%d, farm_broken=%s); falling back to Yahoo/SQLite for historical bars.",
+                    self.hmds_cooldown_s,
+                    self._hmds_consecutive_failures,
+                    self._hmds_farm_broken,
+                )
+
+    def handle_ib_error(
+        self,
+        req_id: int,
+        error_code: int,
+        error_string: str,
+        contract: Any = None,
+    ) -> None:
+        msg = (error_string or "").lower()
+        with self._lock:
+            if error_code == 2105 and "ushmds" in msg:
+                self._hmds_farm_broken = True
+            elif error_code == 2106 and "ushmds" in msg:
+                self._hmds_farm_broken = False
+                self._hmds_consecutive_failures = 0
+                self._hmds_cooldown_until = 0.0
 
     def _ensure_worker(self) -> None:
         if self._worker is None or not self._worker.is_alive():
@@ -379,6 +423,14 @@ class IbkrSessionWorker:
                     self._in_flight_count += 1
 
                 try:
+                    if job.is_hmds and self.is_hmds_circuit_open():
+                        with self._lock:
+                            self._hmds_circuit_skips += 1
+                        self._cleanup_inflight(job.dedup_key, job.future)
+                        if not job.future.done():
+                            job.future.set_result(None)
+                        continue
+
                     limiter = self.hmds_limiter if job.is_hmds else self.live_limiter
                     if not limiter.acquire(max_wait=job.max_wait):
                         if job.is_hmds:
@@ -403,6 +455,7 @@ class IbkrSessionWorker:
                         from ib_async import IB
 
                         candidate_ib = IB()
+                        candidate_ib.errorEvent += self.handle_ib_error
                         try:
                             loop.run_until_complete(
                                 candidate_ib.connectAsync(
@@ -436,6 +489,9 @@ class IbkrSessionWorker:
                         return await asyncio.wait_for(job.coro_factory(ib), timeout=job.timeout)
 
                     res = loop.run_until_complete(_exec())
+                    if job.is_hmds:
+                        ok = res is not None and (not hasattr(res, "empty") or not res.empty)
+                        self.record_hmds_outcome(bool(ok))
                     last_used_mono = time.monotonic()
                     self._cleanup_inflight(job.dedup_key, job.future)
                     with self._lock:
@@ -443,6 +499,8 @@ class IbkrSessionWorker:
                     if not job.future.done():
                         job.future.set_result(res)
                 except Exception as exc:
+                    if job.is_hmds:
+                        self.record_hmds_outcome(False)
                     if isinstance(exc, (ConnectionError, OSError)) or (ib is not None and not ib.isConnected()):
                         _disconnect_ib()
                     self._cleanup_inflight(job.dedup_key, job.future)
@@ -470,6 +528,9 @@ class IbkrSessionWorker:
                 "dedup_hits": self._dedup_hits,
                 "errors": self._errors,
                 "hmds_budget_skips": self._hmds_budget_skips,
+                "hmds_circuit_open": time.monotonic() < self._hmds_cooldown_until,
+                "hmds_farm_broken": self._hmds_farm_broken,
+                "hmds_circuit_skips": self._hmds_circuit_skips,
                 "hmds_limiter": self.hmds_limiter.stats(),
                 "live_limiter": self.live_limiter.stats(),
             }

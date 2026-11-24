@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import socket
+import time
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -362,6 +363,7 @@ def fetch_historical_bars_ibkr(
     sym = symbol.strip().upper().replace(".", "-")
     bar_size_map = {"1d": "1 day", "1h": "1 hour", "1w": "1 week"}
     bar_size = bar_size_map[timeframe]
+    req_timeout = 6.0 if duration.strip().upper().endswith(("D", "M")) else 12.0
 
     async def _fetch(ib: Any) -> pd.DataFrame | None:
         try:
@@ -369,6 +371,7 @@ def fetch_historical_bars_ibkr(
             qualified = await ib.qualifyContractsAsync(contract)
             if not qualified:
                 return None
+            t0 = time.monotonic()
             bars = await ib.reqHistoricalDataAsync(
                 qualified[0],
                 endDateTime="",
@@ -377,9 +380,9 @@ def fetch_historical_bars_ibkr(
                 whatToShow="TRADES",
                 useRTH=True,
                 formatDate=2,
-                timeout=12.0,
+                timeout=req_timeout,
             )
-            if not bars and sym in ("^VIX", "VIX"):
+            if not bars and sym in ("^VIX", "VIX") and (time.monotonic() - t0) < 3.5:
                 bars = await ib.reqHistoricalDataAsync(
                     qualified[0],
                     endDateTime="",
@@ -388,7 +391,7 @@ def fetch_historical_bars_ibkr(
                     whatToShow="MIDPOINT",
                     useRTH=True,
                     formatDate=2,
-                    timeout=12.0,
+                    timeout=req_timeout,
                 )
             if not bars:
                 return None
@@ -423,7 +426,7 @@ def fetch_historical_bars_ibkr(
         priority=priority,
         is_hmds=True,
         dedup_key=f"ibkr:hist:{sym}:{timeframe}:{duration}",
-        timeout=20.0,
+        timeout=req_timeout + 6.0,
         max_wait=max_wait,
     )
 
