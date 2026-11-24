@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import scan, screener, settings as settings_api, stocks, watchlists
 from app.config import FRONTEND_DIST_DIR
 from app.core.registry import registry
+from app.core.request_queue import shutdown_queues
 from app.core.scheduler import configure_scheduler, shutdown_scheduler
 from app.db.models import init_db
 
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_scheduler()
     yield
     shutdown_scheduler()
+    shutdown_queues()
 
 
 def create_app() -> FastAPI:

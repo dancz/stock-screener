@@ -10,8 +10,30 @@ from typing import Any, Literal
 import pandas as pd
 
 from app.core.contracts import SourcePlugin
+from app.core.request_queue import Priority, ibkr_worker
 
 logger = logging.getLogger(__name__)
+
+
+def _make_ibkr_contract(symbol: str) -> Any:
+    from ib_async import Index, Stock
+
+    sym = symbol.strip().upper().replace(".", "-")
+    if sym in ("^VIX", "VIX"):
+        return Index("VIX", "CBOE", "USD")
+    return Stock(sym.replace("-", " "), "SMART", "USD")
+
+
+def period_to_ibkr_duration(period: str, fallback: str = "1 Y") -> str:
+    p = period.strip().lower()
+    if p.endswith("y") and p[:-1].isdigit():
+        return f"{p[:-1]} Y"
+    if p.endswith("mo") and p[:-2].isdigit():
+        return f"{p[:-2]} M"
+    if p.endswith("d") and p[:-1].isdigit():
+        days = int(p[:-1])
+        return f"{max(1, round(days / 365))} Y" if days >= 365 else f"{days} D"
+    return fallback
 
 
 def is_gateway_reachable(host: str, port: int, timeout: float = 0.25) -> bool:
@@ -70,19 +92,18 @@ def fetch_option_chain_with_greeks(
     client_id: int,
     target_dte_min: int = 20,
     target_dte_max: int = 60,
+    priority: int = Priority.NORMAL,
 ) -> pd.DataFrame | None:
-    """Read-only fetch of IBKR option chain + model/market Greeks. Returns None on fallback."""
+    """Read-only fetch of IBKR option chain + model/market Greeks via shared session."""
     if not is_gateway_reachable(host, port, timeout=0.25):
         return None
+    sym = symbol.strip().upper().replace(".", "-")
 
-    async def _fetch() -> pd.DataFrame | None:
-        from ib_async import IB, Option, Stock
+    async def _fetch(ib: Any) -> pd.DataFrame | None:
+        from ib_async import Option
 
-        ib = IB()
         try:
-            await ib.connectAsync(host, int(port), clientId=int(client_id) + 1, timeout=3.0, readonly=True)
-            ib.reqMarketDataType(3)  # Delayed data allowed if real-time subscription is absent
-            stock = Stock(symbol, "SMART", "USD")
+            stock = _make_ibkr_contract(sym)
             qualified = await ib.qualifyContractsAsync(stock)
             if not qualified:
                 return None
@@ -120,12 +141,15 @@ def fetch_option_chain_with_greeks(
             opt_contracts = []
             for strike in strikes:
                 for right in ("C", "P"):
-                    opt_contracts.append(Option(symbol, chosen_raw, float(strike), right, "SMART"))
+                    opt_contracts.append(Option(contract.symbol, chosen_raw, float(strike), right, "SMART"))
 
             qualified_opts = await ib.qualifyContractsAsync(*opt_contracts)
             if not qualified_opts:
                 return None
-            tickers = await ib.reqTickersAsync(*qualified_opts)
+            try:
+                tickers = await asyncio.wait_for(ib.reqTickersAsync(*qualified_opts), timeout=12.0)
+            except asyncio.TimeoutError:
+                tickers = [t for t in (ib.ticker(c) for c in qualified_opts) if t is not None]
 
             rows: list[dict[str, Any]] = []
             for tk in tickers:
@@ -158,16 +182,20 @@ def fetch_option_chain_with_greeks(
                 return None
             return pd.DataFrame(rows)
         except Exception as exc:
-            logger.debug("IBKR option fetch fallback for %s: %s", symbol, exc)
+            logger.debug("IBKR option fetch fallback for %s: %s", sym, exc)
             return None
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
 
-    try:
-        return _run_async(_fetch())
-    except Exception:
-        return None
+    return ibkr_worker.run(
+        _fetch,
+        host=host,
+        port=port,
+        client_id=client_id,
+        priority=priority,
+        is_hmds=False,
+        dedup_key=f"ibkr:opt:{sym}",
+        timeout=20.0,
+        max_wait=5.0,
+    )
 
 
 def fetch_live_quote_ibkr(
@@ -175,19 +203,16 @@ def fetch_live_quote_ibkr(
     host: str,
     port: int,
     client_id: int,
+    priority: int = Priority.HIGH,
 ) -> dict[str, Any] | None:
-    """Read-only IBKR Gateway snapshot quote (supports delayed data when live subscription absent)."""
+    """Read-only IBKR Gateway snapshot quote via shared session."""
     if not is_gateway_reachable(host, port, timeout=0.25):
         return None
+    sym = symbol.strip().upper().replace(".", "-")
 
-    async def _fetch() -> dict[str, Any] | None:
-        from ib_async import IB, Stock
-
-        ib = IB()
+    async def _fetch(ib: Any) -> dict[str, Any] | None:
         try:
-            await ib.connectAsync(host, int(port), clientId=int(client_id) + 2, timeout=3.0, readonly=True)
-            ib.reqMarketDataType(3)
-            contract = Stock(symbol.upper(), "SMART", "USD")
+            contract = _make_ibkr_contract(sym)
             qualified = await ib.qualifyContractsAsync(contract)
             if not qualified:
                 return None
@@ -212,7 +237,7 @@ def fetch_live_quote_ibkr(
                 return None
             chg_pct = ((price / prev_close) - 1.0) * 100.0 if prev_close and prev_close > 0 else 0.0
             return {
-                "symbol": symbol.upper(),
+                "symbol": sym,
                 "price": round(price, 2),
                 "previous_close": round(prev_close, 2) if prev_close else None,
                 "change_pct": round(chg_pct, 2),
@@ -224,16 +249,20 @@ def fetch_live_quote_ibkr(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as exc:
-            logger.debug("IBKR live quote fallback for %s: %s", symbol, exc)
+            logger.debug("IBKR live quote fallback for %s: %s", sym, exc)
             return None
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
 
-    try:
-        return _run_async(_fetch())
-    except Exception:
-        return None
+    return ibkr_worker.run(
+        _fetch,
+        host=host,
+        port=port,
+        client_id=client_id,
+        priority=priority,
+        is_hmds=False,
+        dedup_key=f"ibkr:quote:{sym}",
+        timeout=10.0,
+        max_wait=3.0,
+    )
 
 
 def fetch_live_quotes_batch_ibkr(
@@ -241,23 +270,19 @@ def fetch_live_quotes_batch_ibkr(
     host: str,
     port: int,
     client_id: int,
+    priority: int = Priority.HIGH,
 ) -> dict[str, dict[str, Any]]:
-    """Read-only batch IBKR Gateway quote lookup for multiple tickers in one short session."""
+    """Read-only batch IBKR Gateway quote lookup via shared session."""
     unique = [s.strip().upper().replace(".", "-") for s in dict.fromkeys(symbols) if s.strip()][:40]
     if not unique or not is_gateway_reachable(host, port, timeout=0.25):
         return {}
 
     ibkr_to_db = {sym.replace("-", " "): sym for sym in unique}
 
-    async def _fetch_batch() -> dict[str, dict[str, Any]]:
-        from ib_async import IB, Stock
-
-        ib = IB()
+    async def _fetch_batch(ib: Any) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
         try:
-            await ib.connectAsync(host, int(port), clientId=int(client_id) + 4, timeout=3.0, readonly=True)
-            ib.reqMarketDataType(3)
-            contracts = [Stock(sym.replace("-", " "), "SMART", "USD") for sym in unique]
+            contracts = [_make_ibkr_contract(sym) for sym in unique]
             qualified = await asyncio.wait_for(ib.qualifyContractsAsync(*contracts), timeout=4.0)
             valid_contracts = [c for c in (qualified or []) if c is not None and getattr(c, "conId", 0)]
             if not valid_contracts:
@@ -265,8 +290,8 @@ def fetch_live_quotes_batch_ibkr(
             try:
                 tickers = await asyncio.wait_for(ib.reqTickersAsync(*valid_contracts), timeout=8.5)
             except asyncio.TimeoutError:
-                # Preserve any partial quotes populated before the timeout (e.g. cold usfarm connect)
-                tickers = ib.tickers()
+                # Preserve only partial quotes belonging to this request on the shared IB session
+                tickers = [t for t in (ib.ticker(c) for c in valid_contracts) if t is not None]
             now_iso = datetime.now(timezone.utc).isoformat()
             for tk in tickers or []:
                 c = getattr(tk, "contract", None)
@@ -306,14 +331,19 @@ def fetch_live_quotes_batch_ibkr(
         except Exception as exc:
             logger.debug("IBKR batch quote fallback (%d symbols): %s", len(unique), exc)
             return out
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
 
-    try:
-        return _run_async(_fetch_batch())
-    except Exception:
-        return {}
+    res = ibkr_worker.run(
+        _fetch_batch,
+        host=host,
+        port=port,
+        client_id=client_id,
+        priority=priority,
+        is_hmds=False,
+        dedup_key=None,
+        timeout=16.0,
+        max_wait=3.0,
+    )
+    return res if isinstance(res, dict) else {}
 
 
 def fetch_historical_bars_ibkr(
@@ -323,21 +353,19 @@ def fetch_historical_bars_ibkr(
     host: str,
     port: int,
     client_id: int,
+    priority: int = Priority.NORMAL,
+    max_wait: float = 6.0,
 ) -> pd.DataFrame | None:
-    """Read-only IBKR Gateway historical bar download with transparent fallback on failure."""
+    """Read-only IBKR Gateway historical bar download paced through shared HMDS limiter."""
     if not is_gateway_reachable(host, port, timeout=0.25):
         return None
-
+    sym = symbol.strip().upper().replace(".", "-")
     bar_size_map = {"1d": "1 day", "1h": "1 hour", "1w": "1 week"}
     bar_size = bar_size_map[timeframe]
 
-    async def _fetch() -> pd.DataFrame | None:
-        from ib_async import IB, Stock
-
-        ib = IB()
+    async def _fetch(ib: Any) -> pd.DataFrame | None:
         try:
-            await ib.connectAsync(host, int(port), clientId=int(client_id) + 3, timeout=3.0, readonly=True)
-            contract = Stock(symbol.upper(), "SMART", "USD")
+            contract = _make_ibkr_contract(sym)
             qualified = await ib.qualifyContractsAsync(contract)
             if not qualified:
                 return None
@@ -351,6 +379,17 @@ def fetch_historical_bars_ibkr(
                 formatDate=2,
                 timeout=12.0,
             )
+            if not bars and sym in ("^VIX", "VIX"):
+                bars = await ib.reqHistoricalDataAsync(
+                    qualified[0],
+                    endDateTime="",
+                    durationStr=duration,
+                    barSizeSetting=bar_size,
+                    whatToShow="MIDPOINT",
+                    useRTH=True,
+                    formatDate=2,
+                    timeout=12.0,
+                )
             if not bars:
                 return None
             rows = []
@@ -373,16 +412,20 @@ def fetch_historical_bars_ibkr(
             df = pd.DataFrame(rows)
             return df.sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
         except Exception as exc:
-            logger.debug("IBKR historical bars fallback for %s (%s): %s", symbol, timeframe, exc)
+            logger.debug("IBKR historical bars fallback for %s (%s): %s", sym, timeframe, exc)
             return None
-        finally:
-            if ib.isConnected():
-                ib.disconnect()
 
-    try:
-        return _run_async(_fetch())
-    except Exception:
-        return None
+    return ibkr_worker.run(
+        _fetch,
+        host=host,
+        port=port,
+        client_id=client_id,
+        priority=priority,
+        is_hmds=True,
+        dedup_key=f"ibkr:hist:{sym}:{timeframe}:{duration}",
+        timeout=20.0,
+        max_wait=max_wait,
+    )
 
 
 class IbkrMarketDataPlugin(SourcePlugin):

@@ -10,9 +10,14 @@ from sqlalchemy import func
 
 from app.config import get_active_history_periods
 from app.core.pipeline import upsert_candles
+from app.core.request_queue import Priority
 from app.db.database import session_scope
 from app.db.models import Candle, Ticker, WatchlistItem, load_runtime_settings, utcnow
-from app.plugins.sources.market_data_ibkr import fetch_historical_bars_ibkr, is_gateway_reachable
+from app.plugins.sources.market_data_ibkr import (
+    fetch_historical_bars_ibkr,
+    is_gateway_reachable,
+    period_to_ibkr_duration,
+)
 from app.plugins.sources.market_data_yahoo import (
     fetch_daily_batch,
     fetch_intraday_1h,
@@ -141,14 +146,15 @@ def run_history_backfill_batch(max_symbols: int | None = None, force: bool = Fal
                 # 1. Daily bars
                 df_1d = None
                 if use_ibkr:
-                    dur = _period_to_ibkr_duration(d_period, "5 Y") if need_deep else "1 M"
-                    df_1d = fetch_historical_bars_ibkr(sym, "1d", dur, host, port, client_id)
+                    dur = period_to_ibkr_duration(d_period, "5 Y") if need_deep else "1 M"
+                    df_1d = fetch_historical_bars_ibkr(
+                        sym, "1d", dur, host, port, client_id, priority=Priority.LOW, max_wait=15.0
+                    )
                     if df_1d is not None and not df_1d.empty:
                         used_sources.add("IBKR")
-                    time.sleep(1.5)
 
                 if df_1d is None or df_1d.empty:
-                    fetched = fetch_daily_batch([sym], period=d_period, chunk_size=1)
+                    fetched = fetch_daily_batch([sym], period=d_period, chunk_size=1, priority=Priority.LOW)
                     df_1d = fetched.get(sym)
                     if df_1d is not None and not df_1d.empty:
                         used_sources.add("Yahoo")
@@ -164,7 +170,7 @@ def run_history_backfill_batch(max_symbols: int | None = None, force: bool = Fal
                     or 0
                 )
                 if existing_1w_count < 100 or need_deep:
-                    df_1w = fetch_weekly_bars(sym, period=weekly_period)
+                    df_1w = fetch_weekly_bars(sym, period=weekly_period, priority=Priority.LOW)
                     if (df_1w is None or df_1w.empty) and df_1d is not None and not df_1d.empty:
                         df_1w = resample_daily_to_weekly(df_1d)
                     if df_1w is not None and not df_1w.empty:
@@ -174,11 +180,17 @@ def run_history_backfill_batch(max_symbols: int | None = None, force: bool = Fal
                 df_1h = None
                 if use_ibkr and need_deep:
                     df_1h = fetch_historical_bars_ibkr(
-                        sym, "1h", _period_to_ibkr_duration(h_period, "1 Y"), host, port, client_id
+                        sym,
+                        "1h",
+                        period_to_ibkr_duration(h_period, "1 Y"),
+                        host,
+                        port,
+                        client_id,
+                        priority=Priority.LOW,
+                        max_wait=15.0,
                     )
-                    time.sleep(1.5)
                 if df_1h is None or df_1h.empty:
-                    df_1h = fetch_intraday_1h(sym, period=h_period)
+                    df_1h = fetch_intraday_1h(sym, period=h_period, priority=Priority.LOW)
                 if df_1h is not None and not df_1h.empty:
                     upsert_candles(session, sym, "1h", df_1h)
 

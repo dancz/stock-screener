@@ -88,6 +88,7 @@ def test_fetch_daily_incremental_buckets_and_preserves_history(tmp_path: Path, m
             "delta_5d": 1,
             "delta_1mo": 1,
             "full": 1,
+            "ibkr_fetched": 0,
             "resynced": 0,
             "cache_fallback": 0,
         }

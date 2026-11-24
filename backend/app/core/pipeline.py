@@ -21,6 +21,7 @@ from app.core.contracts import (
 )
 from app.core.market_regime import BENCHMARKS, SECTORS, compute_market_regime
 from app.core.registry import registry
+from app.core.request_queue import Priority, get_queue_stats
 from app.core.scoring import compute_scores_and_summary
 from app.core.trade_planner import build_trade_plan
 from app.db.database import session_scope
@@ -34,7 +35,12 @@ from app.db.models import (
     utcnow,
 )
 from app.plugins.sources.finnhub_feed import fetch_finnhub_enrichment
-from app.plugins.sources.market_data_ibkr import fetch_option_chain_with_greeks
+from app.plugins.sources.market_data_ibkr import (
+    fetch_historical_bars_ibkr,
+    fetch_option_chain_with_greeks,
+    is_gateway_reachable,
+    period_to_ibkr_duration,
+)
 from app.plugins.sources.market_data_yahoo import (
     fetch_daily_batch,
     fetch_fundamentals_and_events,
@@ -69,7 +75,23 @@ _scan_status: dict[str, Any] = {
 
 def get_scan_status() -> dict[str, Any]:
     with _scan_lock:
-        return dict(_scan_status)
+        status = dict(_scan_status)
+    status["queues"] = get_queue_stats()
+    return status
+
+
+def _resolve_ibkr_cfg(runtime_settings: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not runtime_settings:
+        return None
+    ibkr_cfg = runtime_settings.get("ibkr", {})
+    if not ibkr_cfg.get("enabled", False):
+        return None
+    host = str(ibkr_cfg.get("host", "127.0.0.1"))
+    port = int(ibkr_cfg.get("port", 4002))
+    client_id = int(ibkr_cfg.get("client_id", 17))
+    if not is_gateway_reachable(host, port, timeout=0.25):
+        return None
+    return {"host": host, "port": port, "client_id": client_id}
 
 
 def _update_scan_status(**kwargs: Any) -> None:
@@ -202,10 +224,22 @@ def fetch_daily_incremental(
     chunk_size: int = 60,
     now_ts: int | None = None,
     ensure_ticker_fn: Callable[[str], Any] | None = None,
+    ibkr_cfg: dict[str, Any] | None = None,
+    prefer_ibkr: bool = False,
+    ibkr_fallback: bool = True,
+    ibkr_max_fallback: int = 25,
+    priority: int = Priority.NORMAL,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
     """Fetch only missing/delta daily OHLCV bars based on SQLite coverage and auto-resync on splits."""
     unique = [s.strip().upper() for s in dict.fromkeys(symbols) if s and s.strip()]
-    stats = {"delta_5d": 0, "delta_1mo": 0, "full": 0, "resynced": 0, "cache_fallback": 0}
+    stats = {
+        "delta_5d": 0,
+        "delta_1mo": 0,
+        "full": 0,
+        "ibkr_fetched": 0,
+        "resynced": 0,
+        "cache_fallback": 0,
+    }
     if not unique:
         return {}, stats
 
@@ -237,12 +271,69 @@ def fetch_daily_incremental(
             ensure_ticker_fn(sym)
         upsert_candles(session, sym, "1d", df)
 
-    fetched_full = fetch_daily_batch(full_syms, period=full_period, chunk_size=chunk_size) if full_syms else {}
-    delta_frames: dict[str, pd.DataFrame] = {}
-    if delta_5d_syms:
-        delta_frames.update(fetch_daily_batch(delta_5d_syms, period="5d", chunk_size=chunk_size))
-    if delta_1mo_syms:
-        delta_frames.update(fetch_daily_batch(delta_1mo_syms, period="1mo", chunk_size=chunk_size))
+    def _yahoo_batch(syms: list[str], req_period: str) -> dict[str, pd.DataFrame]:
+        if not syms:
+            return {}
+        if priority != Priority.NORMAL:
+            return fetch_daily_batch(syms, period=req_period, chunk_size=chunk_size, priority=priority)
+        return fetch_daily_batch(syms, period=req_period, chunk_size=chunk_size)
+
+    prefetched: dict[str, pd.DataFrame] = {}
+    if prefer_ibkr and ibkr_cfg:
+        for bucket_syms, req_p in ((delta_5d_syms, "5d"), (delta_1mo_syms, "1mo")):
+            dur = period_to_ibkr_duration(req_p, "5 D")
+            for sym in bucket_syms:
+                ib_df = fetch_historical_bars_ibkr(
+                    sym,
+                    "1d",
+                    dur,
+                    host=str(ibkr_cfg["host"]),
+                    port=int(ibkr_cfg["port"]),
+                    client_id=int(ibkr_cfg["client_id"]),
+                    priority=priority,
+                    max_wait=4.0,
+                )
+                if ib_df is not None and not ib_df.empty:
+                    prefetched[sym] = ib_df
+                    stats["ibkr_fetched"] += 1
+
+    fetched_full = _yahoo_batch(full_syms, full_period)
+    delta_frames: dict[str, pd.DataFrame] = dict(prefetched)
+    yahoo_5d = [s for s in delta_5d_syms if s not in prefetched]
+    yahoo_1mo = [s for s in delta_1mo_syms if s not in prefetched]
+    if yahoo_5d:
+        delta_frames.update(_yahoo_batch(yahoo_5d, "5d"))
+    if yahoo_1mo:
+        delta_frames.update(_yahoo_batch(yahoo_1mo, "1mo"))
+
+    # IBKR HMDS fallback for tickers where Yahoo returned nothing
+    if ibkr_fallback and ibkr_cfg:
+        delta_5d_set = set(delta_5d_syms)
+        missing_delta = [
+            s
+            for s in (delta_5d_syms + delta_1mo_syms)
+            if s not in delta_frames or delta_frames[s] is None or delta_frames[s].empty
+        ]
+        missing_full = [
+            s for s in full_syms if s not in fetched_full or fetched_full[s] is None or fetched_full[s].empty
+        ]
+        fb_targets = [(s, "5d" if s in delta_5d_set else "1mo", delta_frames) for s in missing_delta] + [
+            (s, full_period, fetched_full) for s in missing_full
+        ]
+        for sym, req_p, target_map in fb_targets[: max(0, int(ibkr_max_fallback))]:
+            ib_df = fetch_historical_bars_ibkr(
+                sym,
+                "1d",
+                period_to_ibkr_duration(req_p, "5 D"),
+                host=str(ibkr_cfg["host"]),
+                port=int(ibkr_cfg["port"]),
+                client_id=int(ibkr_cfg["client_id"]),
+                priority=priority,
+                max_wait=3.0,
+            )
+            if ib_df is not None and not ib_df.empty:
+                target_map[sym] = ib_df
+                stats["ibkr_fetched"] += 1
 
     result: dict[str, pd.DataFrame] = {}
     for sym in full_syms:
@@ -278,7 +369,7 @@ def fetch_daily_incremental(
             full_period,
             ", ".join(resync_syms),
         )
-        resync_frames = fetch_daily_batch(resync_syms, period=full_period, chunk_size=chunk_size)
+        resync_frames = _yahoo_batch(resync_syms, full_period)
         for sym in resync_syms:
             full_df = resync_frames.get(sym)
             if full_df is not None and not full_df.empty:
@@ -304,6 +395,9 @@ def fetch_intraday_1h_incremental(
     min_bars_for_delta: int = 80,
     now_ts: int | None = None,
     ensure_ticker_fn: Callable[[str], Any] | None = None,
+    ibkr_cfg: dict[str, Any] | None = None,
+    prefer_ibkr: bool = False,
+    priority: int = Priority.NORMAL,
 ) -> tuple[pd.DataFrame, str]:
     """Fetch only recent 1H bars when sufficient intraday history already exists in SQLite."""
     sym = symbol.strip().upper()
@@ -318,7 +412,37 @@ def fetch_intraday_1h_incremental(
             req_period = "1mo"
 
     existing_df = load_candles_df(session, sym, "1h")
-    delta_df = fetch_intraday_1h(sym, period=req_period)
+
+    def _yahoo_1h(req_p: str) -> pd.DataFrame:
+        if priority != Priority.NORMAL:
+            return fetch_intraday_1h(sym, period=req_p, priority=priority)
+        return fetch_intraday_1h(sym, period=req_p)
+
+    delta_df: pd.DataFrame | None = None
+    if prefer_ibkr and ibkr_cfg and req_period != full_period:
+        delta_df = fetch_historical_bars_ibkr(
+            sym,
+            "1h",
+            period_to_ibkr_duration(req_period, "5 D"),
+            host=str(ibkr_cfg["host"]),
+            port=int(ibkr_cfg["port"]),
+            client_id=int(ibkr_cfg["client_id"]),
+            priority=priority,
+            max_wait=4.0,
+        )
+    if delta_df is None or delta_df.empty:
+        delta_df = _yahoo_1h(req_period)
+    if (delta_df is None or delta_df.empty) and ibkr_cfg and not prefer_ibkr:
+        delta_df = fetch_historical_bars_ibkr(
+            sym,
+            "1h",
+            period_to_ibkr_duration(req_period, "5 D"),
+            host=str(ibkr_cfg["host"]),
+            port=int(ibkr_cfg["port"]),
+            client_id=int(ibkr_cfg["client_id"]),
+            priority=priority,
+            max_wait=3.0,
+        )
     if delta_df is None or delta_df.empty:
         return existing_df, "cache_fallback"
 
@@ -333,7 +457,7 @@ def fetch_intraday_1h_incremental(
         and has_historical_adjustment_mismatch(existing_df, delta_df, now_ts=cur_ts)
     ):
         logger.warning("1H adjustment mismatch for %s; resyncing full %s history.", sym, full_period)
-        full_df = fetch_intraday_1h(sym, period=full_period)
+        full_df = _yahoo_1h(full_period)
         if full_df is not None and not full_df.empty:
             session.query(Candle).filter(Candle.symbol == sym, Candle.timeframe == "1h").delete(
                 synchronize_session=False
@@ -467,23 +591,31 @@ def _ensure_ticker_row(
     return row
 
 
-def _fetch_and_store_benchmarks(session: Session, daily_period: str = "2y") -> tuple[dict[str, pd.DataFrame], MarketRegime]:
+def _fetch_and_store_benchmarks(
+    session: Session,
+    daily_period: str = "2y",
+    ibkr_cfg: dict[str, Any] | None = None,
+) -> tuple[dict[str, pd.DataFrame], MarketRegime]:
     ref_symbols = list(BENCHMARKS.keys()) + list(SECTORS.keys())
     merged_frames, bench_stats = fetch_daily_incremental(
         session,
         ref_symbols,
         full_period=daily_period,
         min_bars_for_delta=220,
-        chunk_size=20,
+        chunk_size=15,
         ensure_ticker_fn=lambda sym: _ensure_ticker_row(
             session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym
         ),
+        ibkr_cfg=ibkr_cfg,
+        prefer_ibkr=bool(ibkr_cfg),
+        ibkr_fallback=True,
+        priority=Priority.HIGH,
     )
 
     # Retry core benchmarks missing completely (neither fetched nor cached in DB)
     missing_core = [sym for sym in BENCHMARKS.keys() if sym not in merged_frames or merged_frames[sym].empty]
     for sym in missing_core:
-        retry_map = fetch_daily_batch([sym], period=daily_period, chunk_size=1)
+        retry_map = fetch_daily_batch([sym], period=daily_period, chunk_size=1, priority=Priority.HIGH)
         retry_df = retry_map.get(sym)
         if retry_df is not None and not retry_df.empty:
             _ensure_ticker_row(session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym)
@@ -491,11 +623,12 @@ def _fetch_and_store_benchmarks(session: Session, daily_period: str = "2y") -> t
             merged_frames[sym] = retry_df
 
     logger.info(
-        "Benchmarks/sectors incremental sync (%s): delta_5d=%d delta_1mo=%d full=%d resynced=%d cache_fallback=%d",
+        "Benchmarks/sectors incremental sync (%s): delta_5d=%d delta_1mo=%d full=%d ibkr=%d resynced=%d cache_fallback=%d",
         daily_period,
         bench_stats["delta_5d"],
         bench_stats["delta_1mo"],
         bench_stats["full"],
+        bench_stats["ibkr_fetched"],
         bench_stats["resynced"],
         bench_stats["cache_fallback"],
     )
@@ -690,6 +823,7 @@ def _fetch_options_with_ibkr_fallback(
     spot_price: float,
     days_to_earnings: int | None,
     runtime_settings: dict[str, Any],
+    priority: int = Priority.NORMAL,
 ) -> tuple[pd.DataFrame | None, str]:
     ibkr_cfg = runtime_settings.get("ibkr", {})
     if ibkr_cfg.get("enabled", False):
@@ -699,11 +833,12 @@ def _fetch_options_with_ibkr_fallback(
             host=str(ibkr_cfg.get("host", "127.0.0.1")),
             port=int(ibkr_cfg.get("port", 4002)),
             client_id=int(ibkr_cfg.get("client_id", 17)),
+            priority=priority,
         )
         if chain_df is not None and not chain_df.empty:
             return chain_df, "IBKR Gateway"
 
-    yahoo_chain = fetch_option_chain(symbol, days_to_earnings=days_to_earnings)
+    yahoo_chain = fetch_option_chain(symbol, days_to_earnings=days_to_earnings, priority=priority)
     return yahoo_chain, "Yahoo + BS"
 
 
@@ -744,10 +879,13 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             priority_syms = watchlist_syms | custom_syms
 
             daily_period, intraday_period, _ = get_active_history_periods(runtime_settings)
+            ibkr_cfg = _resolve_ibkr_cfg(runtime_settings)
 
             # 1. Benchmarks & Market Regime
             _update_scan_status(stage="benchmarks", message="Fetching market regime (SPY/QQQ/IWM/VIX & Sectors)...")
-            bench_frames, market_regime = _fetch_and_store_benchmarks(session, daily_period=daily_period)
+            bench_frames, market_regime = _fetch_and_store_benchmarks(
+                session, daily_period=daily_period, ibkr_cfg=ibkr_cfg
+            )
             scan_run.market_regime_json = market_regime.model_dump_json()
             session.commit()
 
@@ -820,15 +958,20 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                 symbols,
                 full_period=daily_period,
                 min_bars_for_delta=220,
-                chunk_size=60,
+                chunk_size=15,
+                ibkr_cfg=ibkr_cfg,
+                prefer_ibkr=(mode == "watchlists"),
+                ibkr_fallback=True,
+                priority=Priority.NORMAL,
             )
             logger.info(
-                "Stage 1 1D sync (%d symbols, full_period=%s): delta_5d=%d delta_1mo=%d full=%d resynced=%d cache_fallback=%d",
+                "Stage 1 1D sync (%d symbols, full_period=%s): delta_5d=%d delta_1mo=%d full=%d ibkr=%d resynced=%d cache_fallback=%d",
                 len(symbols),
                 daily_period,
                 d1_stats["delta_5d"],
                 d1_stats["delta_1mo"],
                 d1_stats["full"],
+                d1_stats["ibkr_fetched"],
                 d1_stats["resynced"],
                 d1_stats["cache_fallback"],
             )
@@ -836,7 +979,7 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                 stage="stage1_analyze",
                 message=(
                     f"Running Stage 1 on {len(daily_frames)} tickers "
-                    f"(5d={d1_stats['delta_5d']}, 1mo={d1_stats['delta_1mo']}, full={d1_stats['full']}, cached={d1_stats['cache_fallback']})..."
+                    f"(5d={d1_stats['delta_5d']}, 1mo={d1_stats['delta_1mo']}, full={d1_stats['full']}, ibkr={d1_stats['ibkr_fetched']}, cached={d1_stats['cache_fallback']})..."
                 ),
             )
 
@@ -895,6 +1038,9 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                         sym,
                         full_period=intraday_period,
                         min_bars_for_delta=80,
+                        ibkr_cfg=ibkr_cfg,
+                        prefer_ibkr=(mode == "watchlists"),
+                        priority=Priority.NORMAL,
                     )
 
                     tk = ticker_rows[sym]
@@ -1056,10 +1202,13 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
     with session_scope() as session:
         runtime_settings = load_runtime_settings(session)
         daily_period, intraday_period, _ = get_active_history_periods(runtime_settings)
+        ibkr_cfg = _resolve_ibkr_cfg(runtime_settings)
         bench_frames = _load_benchmarks_from_db(session)
         market_regime: MarketRegime | None = None
         if "SPY" not in bench_frames or "QQQ" not in bench_frames or len(bench_frames.get("SPY", [])) < 260:
-            bench_frames, market_regime = _fetch_and_store_benchmarks(session, daily_period=daily_period)
+            bench_frames, market_regime = _fetch_and_store_benchmarks(
+                session, daily_period=daily_period, ibkr_cfg=ibkr_cfg
+            )
         else:
             market_regime = compute_market_regime(bench_frames)
 
@@ -1072,6 +1221,10 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
                 min_bars_for_delta=220,
                 chunk_size=1,
                 ensure_ticker_fn=lambda s: _ensure_ticker_row(session, s, is_custom=True),
+                ibkr_cfg=ibkr_cfg,
+                prefer_ibkr=bool(ibkr_cfg),
+                ibkr_fallback=True,
+                priority=Priority.HIGH,
             )
             df_1d = fetched_map.get(sym)
         else:
@@ -1088,6 +1241,9 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
                 full_period=intraday_period,
                 min_bars_for_delta=80,
                 ensure_ticker_fn=lambda s: _ensure_ticker_row(session, s, is_custom=True),
+                ibkr_cfg=ibkr_cfg,
+                prefer_ibkr=bool(ibkr_cfg),
+                priority=Priority.HIGH,
             )
         else:
             df_1h = load_candles_df(session, sym, "1h")
@@ -1102,7 +1258,7 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
             fundamentals, events = cached_fe
             meta = {"name": existing_tk.name, "sector": existing_tk.sector, "industry": existing_tk.industry}
         else:
-            fundamentals, events, meta = fetch_fundamentals_and_events(sym)
+            fundamentals, events, meta = fetch_fundamentals_and_events(sym, priority=Priority.HIGH)
 
         tk = _ensure_ticker_row(
             session,
@@ -1145,7 +1301,7 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
 
         spot = float(df_1d["close"].iloc[-1])
         chain_df, opt_source = _fetch_options_with_ibkr_fallback(
-            sym, spot, events.get("days_to_earnings"), runtime_settings
+            sym, spot, events.get("days_to_earnings"), runtime_settings, priority=Priority.HIGH
         )
 
         bundle = _run_analysis_bundle(
