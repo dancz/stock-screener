@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Literal
 
 import pandas as pd
+from sqlalchemy import func, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
@@ -124,6 +125,303 @@ def load_candles_df(session: Session, symbol: str, timeframe: str) -> pd.DataFra
     return pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
 
 
+def get_candle_coverage(session: Session, symbols: list[str], timeframe: str) -> dict[str, tuple[int, int]]:
+    """Return {symbol: (bar_count, max_ts)} for symbols already cached in SQLite."""
+    unique = [s.strip().upper() for s in dict.fromkeys(symbols) if s and s.strip()]
+    if not unique:
+        return {}
+    coverage: dict[str, tuple[int, int]] = {}
+    for i in range(0, len(unique), 400):
+        chunk = unique[i : i + 400]
+        rows = (
+            session.query(Candle.symbol, func.count(Candle.ts), func.max(Candle.ts))
+            .filter(Candle.timeframe == timeframe, Candle.symbol.in_(chunk))
+            .group_by(Candle.symbol)
+            .all()
+        )
+        for sym, cnt, max_ts in rows:
+            if cnt and max_ts is not None:
+                coverage[str(sym)] = (int(cnt), int(max_ts))
+    return coverage
+
+
+def merge_candle_frames(existing_df: pd.DataFrame | None, delta_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Merge existing DB candles with newly fetched delta candles, deduplicated by ts."""
+    cols = ["ts", "open", "high", "low", "close", "volume"]
+    has_existing = existing_df is not None and not existing_df.empty
+    has_delta = delta_df is not None and not delta_df.empty
+    if not has_existing and not has_delta:
+        return pd.DataFrame(columns=cols)
+    if not has_existing:
+        return delta_df[cols].drop_duplicates(subset=["ts"], keep="last").sort_values("ts").reset_index(drop=True)  # type: ignore[index]
+    if not has_delta:
+        return existing_df[cols].drop_duplicates(subset=["ts"], keep="last").sort_values("ts").reset_index(drop=True)  # type: ignore[index]
+
+    merged = pd.concat([existing_df[cols], delta_df[cols]], ignore_index=True)  # type: ignore[index]
+    merged["ts"] = merged["ts"].astype(int)
+    merged = merged.drop_duplicates(subset=["ts"], keep="last").sort_values("ts").reset_index(drop=True)
+    return merged
+
+
+def has_historical_adjustment_mismatch(
+    existing_df: pd.DataFrame | None,
+    delta_df: pd.DataFrame | None,
+    tol: float = 0.03,
+    now_ts: int | None = None,
+) -> bool:
+    """Detect stock splits or major auto_adjust shifts on overlapping historical bars."""
+    if existing_df is None or existing_df.empty or delta_df is None or delta_df.empty:
+        return False
+    cur_ts = int(now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp())
+    old_map = {int(ts): float(c) for ts, c in zip(existing_df["ts"], existing_df["close"])}
+    new_map = {int(ts): float(c) for ts, c in zip(delta_df["ts"], delta_df["close"])}
+    overlap = sorted(set(old_map.keys()) & set(new_map.keys()))
+    if not overlap:
+        return False
+
+    if len(overlap) >= 2:
+        check_ts = overlap[:-1]
+    elif (cur_ts - overlap[0]) > 86400:
+        check_ts = overlap
+    else:
+        return False
+
+    for ts in check_ts:
+        old_close = old_map[ts]
+        new_close = new_map[ts]
+        if old_close > 0 and abs((new_close / old_close) - 1.0) > tol:
+            return True
+    return False
+
+
+def fetch_daily_incremental(
+    session: Session,
+    symbols: list[str],
+    full_period: str = "2y",
+    min_bars_for_delta: int = 220,
+    chunk_size: int = 60,
+    now_ts: int | None = None,
+    ensure_ticker_fn: Callable[[str], Any] | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
+    """Fetch only missing/delta daily OHLCV bars based on SQLite coverage and auto-resync on splits."""
+    unique = [s.strip().upper() for s in dict.fromkeys(symbols) if s and s.strip()]
+    stats = {"delta_5d": 0, "delta_1mo": 0, "full": 0, "resynced": 0, "cache_fallback": 0}
+    if not unique:
+        return {}, stats
+
+    cur_ts = int(now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp())
+    coverage = get_candle_coverage(session, unique, "1d")
+
+    delta_5d_syms: list[str] = []
+    delta_1mo_syms: list[str] = []
+    full_syms: list[str] = []
+
+    for sym in unique:
+        cov = coverage.get(sym)
+        if cov is not None and cov[0] >= min_bars_for_delta:
+            age_s = max(0, cur_ts - cov[1])
+            if age_s <= 4 * 86400:
+                delta_5d_syms.append(sym)
+                continue
+            if age_s <= 22 * 86400:
+                delta_1mo_syms.append(sym)
+                continue
+        full_syms.append(sym)
+
+    stats["delta_5d"] = len(delta_5d_syms)
+    stats["delta_1mo"] = len(delta_1mo_syms)
+    stats["full"] = len(full_syms)
+
+    def _persist(sym: str, df: pd.DataFrame) -> None:
+        if ensure_ticker_fn is not None:
+            ensure_ticker_fn(sym)
+        upsert_candles(session, sym, "1d", df)
+
+    fetched_full = fetch_daily_batch(full_syms, period=full_period, chunk_size=chunk_size) if full_syms else {}
+    delta_frames: dict[str, pd.DataFrame] = {}
+    if delta_5d_syms:
+        delta_frames.update(fetch_daily_batch(delta_5d_syms, period="5d", chunk_size=chunk_size))
+    if delta_1mo_syms:
+        delta_frames.update(fetch_daily_batch(delta_1mo_syms, period="1mo", chunk_size=chunk_size))
+
+    result: dict[str, pd.DataFrame] = {}
+    for sym in full_syms:
+        df = fetched_full.get(sym)
+        if df is not None and not df.empty:
+            _persist(sym, df)
+            result[sym] = df
+        else:
+            existing_df = load_candles_df(session, sym, "1d")
+            if not existing_df.empty:
+                result[sym] = existing_df
+                stats["cache_fallback"] += 1
+
+    resync_syms: list[str] = []
+    for sym in delta_5d_syms + delta_1mo_syms:
+        existing_df = load_candles_df(session, sym, "1d")
+        delta_df = delta_frames.get(sym)
+        if delta_df is None or delta_df.empty:
+            if not existing_df.empty:
+                result[sym] = existing_df
+                stats["cache_fallback"] += 1
+            continue
+        if not existing_df.empty and has_historical_adjustment_mismatch(existing_df, delta_df, now_ts=cur_ts):
+            resync_syms.append(sym)
+            continue
+        _persist(sym, delta_df)
+        result[sym] = merge_candle_frames(existing_df, delta_df)
+
+    if resync_syms:
+        logger.warning(
+            "Adjustment/split mismatch detected for %d symbol(s); performing full %s resync: %s",
+            len(resync_syms),
+            full_period,
+            ", ".join(resync_syms),
+        )
+        resync_frames = fetch_daily_batch(resync_syms, period=full_period, chunk_size=chunk_size)
+        for sym in resync_syms:
+            full_df = resync_frames.get(sym)
+            if full_df is not None and not full_df.empty:
+                session.query(Candle).filter(Candle.symbol == sym, Candle.timeframe == "1d").delete(
+                    synchronize_session=False
+                )
+                _persist(sym, full_df)
+                result[sym] = full_df
+                stats["resynced"] += 1
+            else:
+                existing_df = load_candles_df(session, sym, "1d")
+                if not existing_df.empty:
+                    result[sym] = existing_df
+                    stats["cache_fallback"] += 1
+
+    return result, stats
+
+
+def fetch_intraday_1h_incremental(
+    session: Session,
+    symbol: str,
+    full_period: str = "120d",
+    min_bars_for_delta: int = 80,
+    now_ts: int | None = None,
+    ensure_ticker_fn: Callable[[str], Any] | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """Fetch only recent 1H bars when sufficient intraday history already exists in SQLite."""
+    sym = symbol.strip().upper()
+    cur_ts = int(now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp())
+    cov = get_candle_coverage(session, [sym], "1h").get(sym)
+    req_period = full_period
+    if cov is not None and cov[0] >= min_bars_for_delta:
+        age_s = max(0, cur_ts - cov[1])
+        if age_s <= 3 * 86400:
+            req_period = "5d"
+        elif age_s <= 20 * 86400:
+            req_period = "1mo"
+
+    existing_df = load_candles_df(session, sym, "1h")
+    delta_df = fetch_intraday_1h(sym, period=req_period)
+    if delta_df is None or delta_df.empty:
+        return existing_df, "cache_fallback"
+
+    def _persist(df: pd.DataFrame) -> None:
+        if ensure_ticker_fn is not None:
+            ensure_ticker_fn(sym)
+        upsert_candles(session, sym, "1h", df)
+
+    if (
+        req_period != full_period
+        and not existing_df.empty
+        and has_historical_adjustment_mismatch(existing_df, delta_df, now_ts=cur_ts)
+    ):
+        logger.warning("1H adjustment mismatch for %s; resyncing full %s history.", sym, full_period)
+        full_df = fetch_intraday_1h(sym, period=full_period)
+        if full_df is not None and not full_df.empty:
+            session.query(Candle).filter(Candle.symbol == sym, Candle.timeframe == "1h").delete(
+                synchronize_session=False
+            )
+            _persist(full_df)
+            return full_df, "resync"
+
+    _persist(delta_df)
+    return merge_candle_frames(existing_df, delta_df), req_period
+
+
+def _load_cached_fundamentals_events(
+    session: Session,
+    ticker: Ticker,
+    max_age_hours: float = 12.0,
+    now_dt: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Reuse recent Stage-2 fundamentals & events from latest deep snapshot, updating days_to_earnings."""
+    if ticker.last_enriched_at is None:
+        return None
+    cur_dt = now_dt if now_dt is not None else utcnow()
+    if cur_dt.tzinfo is None:
+        cur_dt = cur_dt.replace(tzinfo=timezone.utc)
+    enriched_at = ticker.last_enriched_at
+    if enriched_at.tzinfo is None:
+        enriched_at = enriched_at.replace(tzinfo=timezone.utc)
+    if (cur_dt - enriched_at).total_seconds() > max_age_hours * 3600.0:
+        return None
+
+    snap = (
+        session.query(AnalysisSnapshot)
+        .filter(AnalysisSnapshot.symbol == ticker.symbol, AnalysisSnapshot.is_deep_enriched.is_(True))
+        .order_by(AnalysisSnapshot.id.desc())
+        .first()
+    )
+    if snap is None:
+        return None
+
+    try:
+        fundamentals = json.loads(snap.fundamentals_json or "{}")
+        events_raw = json.loads(snap.events_insiders_json or "{}")
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(fundamentals, dict) or not any(v is not None for v in fundamentals.values()):
+        return None
+    if not isinstance(events_raw, dict):
+        events_raw = {}
+
+    events = {k: v for k, v in events_raw.items() if k != "insiders"}
+    next_ed = events.get("next_earnings_date")
+    if isinstance(next_ed, str) and next_ed.strip():
+        try:
+            ed_date = datetime.fromisoformat(next_ed.strip()[:10]).date()
+            dte = (ed_date - cur_dt.date()).days
+            events["days_to_earnings"] = dte
+            if dte <= 1:
+                return None
+        except ValueError:
+            pass
+
+    return fundamentals, events
+
+
+def prune_old_snapshots(session: Session, keep_per_symbol: int = 5) -> int:
+    """Prune stale AnalysisSnapshot rows beyond the most recent keep_per_symbol per symbol."""
+    if keep_per_symbol < 1:
+        return 0
+    res = session.execute(
+        text(
+            """
+            DELETE FROM analysis_snapshots
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY id DESC) AS rn
+                    FROM analysis_snapshots
+                ) WHERE rn > :keep
+            )
+            """
+        ),
+        {"keep": int(keep_per_symbol)},
+    )
+    deleted = int(res.rowcount or 0)
+    if deleted > 0:
+        logger.info("Pruned %d old analysis_snapshots rows (kept latest %d per symbol).", deleted, keep_per_symbol)
+    return deleted
+
+
 def _ensure_ticker_row(
     session: Session,
     symbol: str,
@@ -171,32 +469,41 @@ def _ensure_ticker_row(
 
 def _fetch_and_store_benchmarks(session: Session, daily_period: str = "2y") -> tuple[dict[str, pd.DataFrame], MarketRegime]:
     ref_symbols = list(BENCHMARKS.keys()) + list(SECTORS.keys())
-    cached_frames = _load_benchmarks_from_db(session)
-    fetched = fetch_daily_batch(ref_symbols, period=daily_period, chunk_size=20)
+    merged_frames, bench_stats = fetch_daily_incremental(
+        session,
+        ref_symbols,
+        full_period=daily_period,
+        min_bars_for_delta=220,
+        chunk_size=20,
+        ensure_ticker_fn=lambda sym: _ensure_ticker_row(
+            session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym
+        ),
+    )
 
-    # Retry missing core benchmarks individually before falling back to local DB cache
-    missing_core = [sym for sym in BENCHMARKS.keys() if sym not in fetched or fetched[sym].empty]
+    # Retry core benchmarks missing completely (neither fetched nor cached in DB)
+    missing_core = [sym for sym in BENCHMARKS.keys() if sym not in merged_frames or merged_frames[sym].empty]
     for sym in missing_core:
         retry_map = fetch_daily_batch([sym], period=daily_period, chunk_size=1)
         retry_df = retry_map.get(sym)
         if retry_df is not None and not retry_df.empty:
-            fetched[sym] = retry_df
-
-    for sym, df in fetched.items():
-        if df is not None and not df.empty:
             _ensure_ticker_row(session, sym, name=BENCHMARKS.get(sym) or SECTORS.get(sym) or sym)
-            upsert_candles(session, sym, "1d", df)
+            upsert_candles(session, sym, "1d", retry_df)
+            merged_frames[sym] = retry_df
 
-    merged_frames: dict[str, pd.DataFrame] = dict(cached_frames)
-    for sym, df in fetched.items():
-        if df is not None and not df.empty:
-            merged_frames[sym] = df
-
-    fallback_syms = [
-        sym for sym in ref_symbols if (sym not in fetched or fetched[sym].empty) and sym in cached_frames
-    ]
-    if fallback_syms:
-        logger.warning("Using cached SQLite benchmark/sector candles for: %s", ", ".join(fallback_syms))
+    logger.info(
+        "Benchmarks/sectors incremental sync (%s): delta_5d=%d delta_1mo=%d full=%d resynced=%d cache_fallback=%d",
+        daily_period,
+        bench_stats["delta_5d"],
+        bench_stats["delta_1mo"],
+        bench_stats["full"],
+        bench_stats["resynced"],
+        bench_stats["cache_fallback"],
+    )
+    if bench_stats["cache_fallback"] > 0:
+        logger.warning(
+            "Using cached SQLite benchmark/sector candles for %d symbol(s) after empty fetch.",
+            bench_stats["cache_fallback"],
+        )
 
     regime = compute_market_regime(merged_frames)
     if not regime.benchmarks:
@@ -507,15 +814,36 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                 else {}
             )
 
-            # 3. Stage 1: Batch Daily OHLCV + Fast Technical Pass
-            daily_frames = fetch_daily_batch(symbols, period=daily_period, chunk_size=60)
-            _update_scan_status(stage="stage1_analyze", message=f"Running Stage 1 technical analysis on {len(daily_frames)} tickers...")
+            # 3. Stage 1: Incremental Daily OHLCV + Fast Technical Pass
+            daily_frames, d1_stats = fetch_daily_incremental(
+                session,
+                symbols,
+                full_period=daily_period,
+                min_bars_for_delta=220,
+                chunk_size=60,
+            )
+            logger.info(
+                "Stage 1 1D sync (%d symbols, full_period=%s): delta_5d=%d delta_1mo=%d full=%d resynced=%d cache_fallback=%d",
+                len(symbols),
+                daily_period,
+                d1_stats["delta_5d"],
+                d1_stats["delta_1mo"],
+                d1_stats["full"],
+                d1_stats["resynced"],
+                d1_stats["cache_fallback"],
+            )
+            _update_scan_status(
+                stage="stage1_analyze",
+                message=(
+                    f"Running Stage 1 on {len(daily_frames)} tickers "
+                    f"(5d={d1_stats['delta_5d']}, 1mo={d1_stats['delta_1mo']}, full={d1_stats['full']}, cached={d1_stats['cache_fallback']})..."
+                ),
+            )
 
             stage1_bundles: dict[str, dict[str, Any]] = {}
             for idx, (sym, df) in enumerate(daily_frames.items(), start=1):
                 if len(df) < 15:
                     continue
-                upsert_candles(session, sym, "1d", df)
                 bundle = _run_analysis_bundle(
                     symbol=sym,
                     daily_df=df,
@@ -554,6 +882,7 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             )
 
             deep_enriched_bundles: dict[str, dict[str, Any]] = {}
+            cached_fundamentals_count = 0
             finnhub_key = str(runtime_settings.get("data_sources", {}).get("finnhub_api_key", "")).strip()
             sec_ua = str(runtime_settings.get("data_sources", {}).get("sec_user_agent", "StockScreener/1.0"))
             use_sec = runtime_settings.get("enabled_plugins", {}).get("sec_edgar_form4", False)
@@ -561,28 +890,37 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             for idx, sym in enumerate(deep_list, start=1):
                 try:
                     df_1d = daily_frames[sym]
-                    df_1h = fetch_intraday_1h(sym, period=intraday_period)
-                    if not df_1h.empty:
-                        upsert_candles(session, sym, "1h", df_1h)
+                    df_1h, _h1_mode = fetch_intraday_1h_incremental(
+                        session,
+                        sym,
+                        full_period=intraday_period,
+                        min_bars_for_delta=80,
+                    )
 
-                    fundamentals, events, meta = fetch_fundamentals_and_events(sym)
                     tk = ticker_rows[sym]
-                    if meta.get("name") and tk.name == sym:
-                        tk.name = meta["name"]
-                    if meta.get("sector") and not tk.sector:
-                        tk.sector = meta["sector"]
-                        tk.sector_etf = map_sector_to_etf(meta["sector"])
-                        tk.primary_benchmark = get_primary_benchmark(sym, sector=meta["sector"])
-                    if meta.get("industry") and not tk.industry:
-                        tk.industry = meta["industry"]
-                    tk.last_enriched_at = utcnow()
+                    cached_fe = _load_cached_fundamentals_events(session, tk, max_age_hours=12.0)
+                    if cached_fe is not None:
+                        fundamentals, events = cached_fe
+                        cached_fundamentals_count += 1
+                    else:
+                        fundamentals, events, meta = fetch_fundamentals_and_events(sym)
+                        if meta.get("name") and tk.name == sym:
+                            tk.name = meta["name"]
+                        if meta.get("sector") and not tk.sector:
+                            tk.sector = meta["sector"]
+                            tk.sector_etf = map_sector_to_etf(meta["sector"])
+                            tk.primary_benchmark = get_primary_benchmark(sym, sector=meta["sector"])
+                        if meta.get("industry") and not tk.industry:
+                            tk.industry = meta["industry"]
+                        if any(v is not None for v in fundamentals.values()):
+                            tk.last_enriched_at = utcnow()
 
-                    if finnhub_key:
-                        fh = fetch_finnhub_enrichment(sym, finnhub_key)
-                        if fh.get("news"):
-                            events["news"] = fh["news"]
-                        if fh.get("analyst_breakdown"):
-                            events["analyst_breakdown"] = fh["analyst_breakdown"]
+                        if finnhub_key:
+                            fh = fetch_finnhub_enrichment(sym, finnhub_key)
+                            if fh.get("news"):
+                                events["news"] = fh["news"]
+                            if fh.get("analyst_breakdown"):
+                                events["analyst_breakdown"] = fh["analyst_breakdown"]
 
                     insiders = list(insider_map.get(sym, []))
                     if use_sec and not insiders:
@@ -628,6 +966,20 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             scan_run.processed_tickers = len(stage1_bundles)
             scan_run.finished_at = utcnow()
             session.commit()
+
+            pruned = prune_old_snapshots(session, keep_per_symbol=5)
+            if pruned:
+                session.commit()
+            logger.info(
+                "Scan #%s (%s) completed: analyzed=%d deep=%d cached_fundamentals=%d/%d pruned_snapshots=%d",
+                scan_run_id,
+                mode,
+                len(stage1_bundles),
+                len(deep_enriched_bundles),
+                cached_fundamentals_count,
+                len(deep_list),
+                pruned,
+            )
 
             # 5. Dispatch optional notifiers
             _dispatch_notifications(runtime_settings, deep_enriched_bundles, priority_syms, market_regime)
@@ -711,25 +1063,47 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
         else:
             market_regime = compute_market_regime(bench_frames)
 
-        df_1d = load_candles_df(session, sym, "1d")
-        if force_refresh or len(df_1d) < 30:
-            fetched = fetch_daily_batch([sym], period=daily_period, chunk_size=1)
-            if sym in fetched and not fetched[sym].empty:
-                df_1d = fetched[sym]
-                _ensure_ticker_row(session, sym, is_custom=True)
-                upsert_candles(session, sym, "1d", df_1d)
+        existing_1d_count = get_candle_coverage(session, [sym], "1d").get(sym, (0, 0))[0]
+        if force_refresh or existing_1d_count < 30:
+            fetched_map, _ = fetch_daily_incremental(
+                session,
+                [sym],
+                full_period=daily_period,
+                min_bars_for_delta=220,
+                chunk_size=1,
+                ensure_ticker_fn=lambda s: _ensure_ticker_row(session, s, is_custom=True),
+            )
+            df_1d = fetched_map.get(sym)
+        else:
+            df_1d = load_candles_df(session, sym, "1d")
 
         if df_1d is None or df_1d.empty:
             return None
 
-        df_1h = load_candles_df(session, sym, "1h")
-        if force_refresh or df_1h.empty:
-            df_1h = fetch_intraday_1h(sym, period=intraday_period)
-            if not df_1h.empty:
-                _ensure_ticker_row(session, sym, is_custom=True)
-                upsert_candles(session, sym, "1h", df_1h)
+        existing_1h_count = get_candle_coverage(session, [sym], "1h").get(sym, (0, 0))[0]
+        if force_refresh or existing_1h_count == 0:
+            df_1h, _ = fetch_intraday_1h_incremental(
+                session,
+                sym,
+                full_period=intraday_period,
+                min_bars_for_delta=80,
+                ensure_ticker_fn=lambda s: _ensure_ticker_row(session, s, is_custom=True),
+            )
+        else:
+            df_1h = load_candles_df(session, sym, "1h")
 
-        fundamentals, events, meta = fetch_fundamentals_and_events(sym)
+        existing_tk = session.get(Ticker, sym)
+        cached_fe = (
+            _load_cached_fundamentals_events(session, existing_tk, max_age_hours=12.0)
+            if (not force_refresh and existing_tk is not None)
+            else None
+        )
+        if cached_fe is not None:
+            fundamentals, events = cached_fe
+            meta = {"name": existing_tk.name, "sector": existing_tk.sector, "industry": existing_tk.industry}
+        else:
+            fundamentals, events, meta = fetch_fundamentals_and_events(sym)
+
         tk = _ensure_ticker_row(
             session,
             sym,
@@ -739,23 +1113,25 @@ def enrich_single_ticker(symbol: str, force_refresh: bool = True) -> dict[str, A
             source_tags=["on_demand"],
             is_custom=True,
         )
-        if meta.get("name"):
-            tk.name = meta["name"]
-        if meta.get("sector"):
-            tk.sector = meta["sector"]
-            tk.sector_etf = map_sector_to_etf(meta["sector"])
-            tk.primary_benchmark = get_primary_benchmark(sym, sector=meta["sector"])
-        if meta.get("industry"):
-            tk.industry = meta["industry"]
-        tk.last_enriched_at = utcnow()
+        if cached_fe is None:
+            if meta.get("name"):
+                tk.name = meta["name"]
+            if meta.get("sector"):
+                tk.sector = meta["sector"]
+                tk.sector_etf = map_sector_to_etf(meta["sector"])
+                tk.primary_benchmark = get_primary_benchmark(sym, sector=meta["sector"])
+            if meta.get("industry"):
+                tk.industry = meta["industry"]
+            if any(v is not None for v in fundamentals.values()):
+                tk.last_enriched_at = utcnow()
 
-        finnhub_key = str(runtime_settings.get("data_sources", {}).get("finnhub_api_key", "")).strip()
-        if finnhub_key:
-            fh = fetch_finnhub_enrichment(sym, finnhub_key)
-            if fh.get("news"):
-                events["news"] = fh["news"]
-            if fh.get("analyst_breakdown"):
-                events["analyst_breakdown"] = fh["analyst_breakdown"]
+            finnhub_key = str(runtime_settings.get("data_sources", {}).get("finnhub_api_key", "")).strip()
+            if finnhub_key:
+                fh = fetch_finnhub_enrichment(sym, finnhub_key)
+                if fh.get("news"):
+                    events["news"] = fh["news"]
+                if fh.get("analyst_breakdown"):
+                    events["analyst_breakdown"] = fh["analyst_breakdown"]
 
         insider_map = (
             fetch_openinsider_map()
