@@ -29,6 +29,14 @@ class LiveAccountBlockedError(RuntimeError):
     """Raised whenever IBKR configuration or session points to a non-paper port or live account."""
 
 
+class GatewayReadOnlyError(RuntimeError):
+    """Raised when IBKR Gateway itself is configured with 'Read-Only API' (Error 321)."""
+
+    def __init__(self, message: str, account: str = "") -> None:
+        super().__init__(message)
+        self.account = account
+
+
 def assert_paper_account(accounts: list[str] | tuple[str, ...], port: int, expected_account: str = "") -> str:
     """Enforce strict Paper-Only safety lock on IBKR port and managed account prefix (DU* / DF*)."""
     p = int(port)
@@ -138,6 +146,11 @@ class IbkrPaperExecutionWorker:
         ib: Any = None
         active_endpoint: tuple[str, int, int] | None = None
         last_used_mono = 0.0
+        readonly_flag = {"hit": False}
+
+        def _on_ib_error(req_id: int, error_code: int, error_string: str, contract: Any = None) -> None:
+            if int(error_code) == 321 and "read-only" in (error_string or "").lower():
+                readonly_flag["hit"] = True
 
         def _disconnect_ib() -> None:
             nonlocal ib, active_endpoint
@@ -149,6 +162,7 @@ class IbkrPaperExecutionWorker:
                     pass
                 ib = None
             active_endpoint = None
+            readonly_flag["hit"] = False
             with self._lock:
                 self._connected = False
                 self._verified_account = ""
@@ -184,6 +198,8 @@ class IbkrPaperExecutionWorker:
                         from ib_async import IB
 
                         cand = IB()
+                        cand.errorEvent += _on_ib_error
+                        readonly_flag["hit"] = False
                         try:
                             loop.run_until_complete(
                                 cand.connectAsync(
@@ -199,6 +215,11 @@ class IbkrPaperExecutionWorker:
                                 job.port,
                                 expected_account=job.expected_account,
                             )
+                            if readonly_flag["hit"]:
+                                raise GatewayReadOnlyError(
+                                    f"Connected to Paper account {du_account} on {job.host}:{job.port}, but IBKR Gateway has 'Read-Only API' enabled (Error 321). Uncheck Configure -> Settings -> API -> Read-Only API in IB Gateway.",
+                                    account=du_account,
+                                )
                             ib = cand
                             active_endpoint = target_endpoint
                             with self._lock:
@@ -217,17 +238,32 @@ class IbkrPaperExecutionWorker:
                             job.port,
                             expected_account=job.expected_account,
                         )
+                        if readonly_flag["hit"]:
+                            raise GatewayReadOnlyError(
+                                f"IBKR Gateway ({du_account}) is in 'Read-Only API' mode (Error 321).",
+                                account=du_account,
+                            )
 
                     async def _exec() -> Any:
                         return await asyncio.wait_for(job.coro_factory(ib, du_account), timeout=job.timeout)
 
                     res = loop.run_until_complete(_exec())
+                    if readonly_flag["hit"]:
+                        raise GatewayReadOnlyError(
+                            f"IBKR Gateway ({du_account}) rejected write operation because 'Read-Only API' mode is active (Error 321).",
+                            account=du_account,
+                        )
                     last_used_mono = time.monotonic()
                     if not job.future.done():
                         job.future.set_result(res)
                 except LiveAccountBlockedError as exc:
                     _disconnect_ib()
                     logger.error("SAFETY LOCK TRIGGERED: %s", exc)
+                    if not job.future.done():
+                        job.future.set_exception(exc)
+                except GatewayReadOnlyError as exc:
+                    _disconnect_ib()
+                    logger.warning("IBKR Gateway Read-Only mode: %s", exc)
                     if not job.future.done():
                         job.future.set_exception(exc)
                 except Exception as exc:
@@ -295,7 +331,7 @@ def probe_ibkr_paper_account(host: str, port: int, client_id: int) -> dict[str, 
 
     async def _probe(ib: Any, du_acct: str) -> dict[str, Any]:
         try:
-            await ib.reqOpenOrdersAsync()
+            await asyncio.wait_for(ib.reqOpenOrdersAsync(), timeout=3.0)
         except Exception:
             pass
         open_orders = [
@@ -349,7 +385,19 @@ def probe_ibkr_paper_account(host: str, port: int, client_id: int) -> dict[str, 
             timeout=10.0,
             max_wait=4.0,
         )
+    except GatewayReadOnlyError as exc:
+        return {
+            "connected": True,
+            "paper_verified": False,
+            "account": exc.account,
+            "open_orders_count": 0,
+            "positions_count": 0,
+            "net_liquidation": None,
+            "currency": "USD",
+            "message": str(exc),
+        }
     except Exception as exc:
+        err_detail = str(exc).strip() or type(exc).__name__
         return {
             "connected": False,
             "paper_verified": False,
@@ -358,7 +406,7 @@ def probe_ibkr_paper_account(host: str, port: int, client_id: int) -> dict[str, 
             "positions_count": 0,
             "net_liquidation": None,
             "currency": "USD",
-            "message": f"Paper account verification failed: {exc}",
+            "message": f"Paper account verification failed: {err_detail}",
         }
 
 
