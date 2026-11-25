@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,6 +16,8 @@ from app.core.paper_risk import (
     ensure_active_paper_run,
     evaluate_candidate_gate,
 )
+from app.core.request_queue import Priority
+from app.core.telegram_bot import dispatch_paper_notification
 from app.core.trade_ideas import build_trade_ideas, get_cached_live_quotes_ibkr
 from app.db.database import session_scope
 from app.db.models import (
@@ -27,10 +30,78 @@ from app.db.models import (
     load_runtime_settings,
     utcnow,
 )
+from app.plugins.sources.market_data_yahoo import fetch_live_quote
 
 logger = logging.getLogger(__name__)
 
 _paper_lock = threading.Lock()
+
+
+def get_live_quotes_with_fallback(
+    symbols: list[str],
+    ibkr_cfg: dict[str, Any] | None = None,
+    *,
+    allow_yahoo_fallback: bool | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fetch IBKR live/delayed quotes first, falling back to Yahoo Finance on missing/10197 symbols."""
+    unique = [s.strip().upper().replace(".", "-") for s in dict.fromkeys(symbols) if s and s.strip()]
+    if not unique:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    if ibkr_cfg and ibkr_cfg.get("enabled", False):
+        try:
+            out.update(get_cached_live_quotes_ibkr(unique, ibkr_cfg) or {})
+        except Exception as exc:
+            logger.debug("IBKR live quote lookup failed: %s", exc)
+
+    use_yahoo = (os.environ.get("PYTEST_CURRENT_TEST") is None) if allow_yahoo_fallback is None else allow_yahoo_fallback
+    if use_yahoo:
+        missing = [s for s in unique if s not in out or not (out[s] or {}).get("price")]
+        for sym in missing[:12]:
+            try:
+                q = fetch_live_quote(sym, priority=Priority.HIGH)
+                if q and q.get("price"):
+                    out[sym] = q
+            except Exception as exc:
+                logger.debug("Yahoo live quote fallback failed for %s: %s", sym, exc)
+    return out
+
+
+def _compute_trailing_stop_candidate(
+    trade: PaperTrade,
+    ref_price: float,
+    paper_cfg: dict[str, Any],
+    *,
+    confirm_close_price: float | None = None,
+) -> float | None:
+    """Compute tighter ATR trailing stop once trade exceeds trailing_activation_r."""
+    if not bool(paper_cfg.get("trailing_stop_enabled", True)):
+        return None
+    activation_r = float(paper_cfg.get("trailing_activation_r", 1.5))
+    cur_r = _compute_current_r(trade, ref_price)
+    if cur_r < activation_r:
+        return None
+
+    atr_mult = max(0.5, float(paper_cfg.get("trailing_atr_mult", 2.0)))
+    entry_px = float(trade.entry_fill_price or trade.planned_limit_price or 0.0)
+    eff_atr = float(trade.atr_at_entry or 0.0)
+    if eff_atr <= 0 and entry_px > 0:
+        eff_atr = abs(entry_px - float(trade.planned_stop_loss or entry_px * 0.96))
+    if eff_atr <= 0 or ref_price <= 0:
+        return None
+
+    min_step = max(0.05, (entry_px or ref_price) * 0.002)
+    guard_px = confirm_close_price if confirm_close_price is not None else ref_price
+    if trade.direction == "LONG":
+        cand = round(ref_price - atr_mult * eff_atr, 2)
+        if cand >= float(trade.current_stop_loss) + min_step and cand < guard_px - 0.01:
+            return cand
+        return None
+
+    cand = round(ref_price + atr_mult * eff_atr, 2)
+    if cand <= float(trade.current_stop_loss) - min_step and cand > guard_px + 0.01:
+        return cand
+    return None
 
 
 def _log_event(
@@ -195,9 +266,11 @@ def _load_post_bars(
     symbol: str,
     since_dt: datetime,
     bars_overrides: dict[str, list[dict[str, Any]]] | None = None,
+    min_ts_exclusive: int | None = None,
 ) -> list[dict[str, float]]:
     if bars_overrides and symbol in bars_overrides:
         since_ts = int(since_dt.timestamp())
+        sorted_bars = sorted(bars_overrides[symbol], key=lambda x: int(x["ts"]))
         return [
             {
                 "ts": int(b["ts"]),
@@ -206,11 +279,11 @@ def _load_post_bars(
                 "low": float(b["low"]),
                 "close": float(b["close"]),
             }
-            for b in sorted(bars_overrides[symbol], key=lambda x: int(x["ts"]))
-            if int(b["ts"]) >= since_ts
+            for b in sorted_bars
+            if (int(b["ts"]) > int(min_ts_exclusive) if min_ts_exclusive is not None else int(b["ts"]) >= since_ts)
         ]
 
-    since_ts = int(since_dt.timestamp())
+    since_ts = max(int(since_dt.timestamp()), int(min_ts_exclusive)) if min_ts_exclusive is not None else int(since_dt.timestamp())
     rows_1h = (
         session.query(Candle.ts, Candle.open, Candle.high, Candle.low, Candle.close)
         .filter(Candle.symbol == symbol, Candle.timeframe == "1h", Candle.ts > since_ts)
@@ -225,9 +298,12 @@ def _load_post_bars(
 
     # Daily bars represent full sessions; only evaluate strictly later UTC days to avoid lookahead
     next_day_dt = datetime.combine(since_dt.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    min_day_ts = int(next_day_dt.timestamp())
+    if min_ts_exclusive is not None:
+        min_day_ts = max(min_day_ts, int(min_ts_exclusive) + 1)
     rows_1d = (
         session.query(Candle.ts, Candle.open, Candle.high, Candle.low, Candle.close)
-        .filter(Candle.symbol == symbol, Candle.timeframe == "1d", Candle.ts >= int(next_day_dt.timestamp()))
+        .filter(Candle.symbol == symbol, Candle.timeframe == "1d", Candle.ts >= min_day_ts)
         .order_by(Candle.ts.asc())
         .all()
     )
@@ -316,14 +392,15 @@ def step_virtual_lifecycle(
     quotes_map: dict[str, dict[str, Any]] = {}
     if active and price_overrides is None and bars_overrides is None:
         ibkr_cfg = runtime.get("ibkr", {})
-        if ibkr_cfg.get("enabled", False):
-            syms = list(dict.fromkeys(t.symbol for t in active))
-            quotes_map = get_cached_live_quotes_ibkr(syms, ibkr_cfg)
+        syms = list(dict.fromkeys(t.symbol for t in active))
+        quotes_map = get_live_quotes_with_fallback(syms, ibkr_cfg)
 
     filled_count = 0
     expired_count = 0
     closed_count = 0
     be_moved_count = 0
+    trailing_moved_count = 0
+    was_halted = bool(target_run.kill_switch_triggered)
 
     for trade in active:
         if trade.status == "PENDING_ENTRY":
@@ -370,6 +447,7 @@ def step_virtual_lifecycle(
                 trade.entry_slippage_bps = _compute_slippage_bps(trade.direction, trade.planned_limit_price, fill_px)
                 trade.risk_amount_usd = round(abs(fill_px - trade.current_stop_loss) * qty, 2)
                 trade.filled_at = fill_dt
+                trade.last_evaluated_bar_ts = int(filled_bar["ts"]) if filled_bar is not None else int(cur_dt.timestamp())
                 trade.unrealized_pnl_usd = 0.0
                 filled_count += 1
 
@@ -383,7 +461,16 @@ def step_virtual_lifecycle(
                     {"fill_price": fill_px, "quantity": qty, "slippage_bps": trade.entry_slippage_bps},
                     created_at=fill_dt,
                 )
-                # Continue to evaluate subsequent bars after fill_dt if any!
+                dispatch_paper_notification(
+                    runtime,
+                    "orders",
+                    f"Virtual Limit Filled: {trade.direction} {trade.symbol}",
+                    [
+                        f"Qty: {qty} @ ${fill_px:.2f} (limit ${trade.planned_limit_price:.2f})",
+                        f"SL: ${trade.current_stop_loss:.2f} · TP1: ${trade.planned_tp1:.2f}",
+                    ],
+                )
+                # Continue to evaluate subsequent bars strictly after fill_dt if any!
             elif cur_dt.date() > sub_dt.date() or (cur_dt - sub_dt) > timedelta(hours=20):
                 reserved = round(float(trade.planned_limit_price) * int(trade.quantity_planned), 2)
                 target_run.cash_balance = round(float(target_run.cash_balance) + reserved, 2)
@@ -405,7 +492,13 @@ def step_virtual_lifecycle(
 
         if trade.status in ("OPEN", "PARTIAL_TP1"):
             filled_dt = as_utc(trade.filled_at or trade.created_at) or cur_dt
-            bars = _load_post_bars(session, trade.symbol, filled_dt, bars_overrides=bars_overrides)
+            bars = _load_post_bars(
+                session,
+                trade.symbol,
+                filled_dt,
+                bars_overrides=bars_overrides,
+                min_ts_exclusive=trade.last_evaluated_bar_ts,
+            )
             exited = False
             for b in bars:
                 bar_dt = datetime.fromtimestamp(int(b["ts"]), tz=timezone.utc)
@@ -424,10 +517,24 @@ def step_virtual_lifecycle(
                         or (trade.direction == "SHORT" and b["open"] > trade.current_stop_loss)
                         else trade.current_stop_loss
                     )
-                    reason = "BREAK_EVEN" if trade.be_moved else "STOP_LOSS"
+                    reason = (
+                        "TRAILING_STOP"
+                        if getattr(trade, "trailing_active", False)
+                        else ("BREAK_EVEN" if trade.be_moved else "STOP_LOSS")
+                    )
                     _close_trade(session, target_run, trade, exit_px, reason, bar_dt)
+                    trade.last_evaluated_bar_ts = max(int(trade.last_evaluated_bar_ts or 0), int(b["ts"]))
                     closed_count += 1
                     exited = True
+                    dispatch_paper_notification(
+                        runtime,
+                        "orders",
+                        f"Virtual Closed: {trade.symbol} ({reason})",
+                        [
+                            f"Exit: ${float(trade.exit_fill_price or exit_px):.2f}",
+                            f"PnL: ${trade.realized_pnl_usd:+.2f} ({trade.r_multiple:+.2f}R)",
+                        ],
+                    )
                     break
 
                 if hit_tp:
@@ -438,8 +545,18 @@ def step_virtual_lifecycle(
                         else trade.planned_tp1
                     )
                     _close_trade(session, target_run, trade, exit_px, "TP1_HIT", bar_dt)
+                    trade.last_evaluated_bar_ts = max(int(trade.last_evaluated_bar_ts or 0), int(b["ts"]))
                     closed_count += 1
                     exited = True
+                    dispatch_paper_notification(
+                        runtime,
+                        "orders",
+                        f"Virtual Target Hit: {trade.symbol} (TP1_HIT)",
+                        [
+                            f"Exit: ${float(trade.exit_fill_price or exit_px):.2f}",
+                            f"PnL: ${trade.realized_pnl_usd:+.2f} ({trade.r_multiple:+.2f}R)",
+                        ],
+                    )
                     break
 
                 # Check Break-Even trigger on favorable excursion if position stays open
@@ -465,6 +582,12 @@ def step_virtual_lifecycle(
                                 {"new_stop_loss": new_sl},
                                 created_at=bar_dt,
                             )
+                            dispatch_paper_notification(
+                                runtime,
+                                "lifecycle",
+                                f"Break-Even Stop: {trade.symbol}",
+                                [f"Moved SL to ${new_sl:.2f} after favorable excursion."],
+                            )
                     else:
                         new_sl = round(min(trade.current_stop_loss, float(trade.entry_fill_price) - offset), 2)
                         if new_sl > b["close"]:
@@ -481,6 +604,38 @@ def step_virtual_lifecycle(
                                 {"new_stop_loss": new_sl},
                                 created_at=bar_dt,
                             )
+                            dispatch_paper_notification(
+                                runtime,
+                                "lifecycle",
+                                f"Break-Even Stop: {trade.symbol}",
+                                [f"Moved short SL to ${new_sl:.2f} after favorable excursion."],
+                            )
+
+                # Dynamic ATR Trailing Stop inside bar
+                cand_trail = _compute_trailing_stop_candidate(trade, fav_px, paper_cfg, confirm_close_price=b["close"])
+                if cand_trail is not None:
+                    trade.current_stop_loss = cand_trail
+                    trade.be_moved = True
+                    trade.trailing_active = True
+                    trailing_moved_count += 1
+                    _log_event(
+                        session,
+                        target_run.id,
+                        trade.id,
+                        trade.symbol,
+                        "SL_TRAILING",
+                        f"Trailed {trade.symbol} stop loss to ${cand_trail:.2f}",
+                        {"new_stop_loss": cand_trail},
+                        created_at=bar_dt,
+                    )
+                    dispatch_paper_notification(
+                        runtime,
+                        "lifecycle",
+                        f"Trailing Stop Raised: {trade.symbol}",
+                        [f"Updated virtual SL to ${cand_trail:.2f}."],
+                    )
+
+                trade.last_evaluated_bar_ts = max(int(trade.last_evaluated_bar_ts or 0), int(b["ts"]))
 
             if exited:
                 continue
@@ -495,9 +650,22 @@ def step_virtual_lifecycle(
             if (trade.direction == "LONG" and mark_px <= trade.current_stop_loss) or (
                 trade.direction == "SHORT" and mark_px >= trade.current_stop_loss
             ):
-                reason = "BREAK_EVEN" if trade.be_moved else "STOP_LOSS"
+                reason = (
+                    "TRAILING_STOP"
+                    if getattr(trade, "trailing_active", False)
+                    else ("BREAK_EVEN" if trade.be_moved else "STOP_LOSS")
+                )
                 _close_trade(session, target_run, trade, mark_px, reason, cur_dt)
                 closed_count += 1
+                dispatch_paper_notification(
+                    runtime,
+                    "orders",
+                    f"Virtual Closed: {trade.symbol} ({reason})",
+                    [
+                        f"Exit: ${float(trade.exit_fill_price or mark_px):.2f}",
+                        f"PnL: ${trade.realized_pnl_usd:+.2f} ({trade.r_multiple:+.2f}R)",
+                    ],
+                )
                 continue
 
             if (trade.direction == "LONG" and mark_px >= trade.planned_tp1) or (
@@ -505,6 +673,15 @@ def step_virtual_lifecycle(
             ):
                 _close_trade(session, target_run, trade, mark_px, "TP1_HIT", cur_dt)
                 closed_count += 1
+                dispatch_paper_notification(
+                    runtime,
+                    "orders",
+                    f"Virtual Target Hit: {trade.symbol} (TP1_HIT)",
+                    [
+                        f"Exit: ${float(trade.exit_fill_price or mark_px):.2f}",
+                        f"PnL: ${trade.realized_pnl_usd:+.2f} ({trade.r_multiple:+.2f}R)",
+                    ],
+                )
                 continue
 
             trade.last_mark_price = round(mark_px, 2)
@@ -519,6 +696,7 @@ def step_virtual_lifecycle(
                     if new_sl > trade.current_stop_loss:
                         trade.current_stop_loss = new_sl
                         trade.be_moved = True
+                        trade.last_evaluated_bar_ts = max(int(trade.last_evaluated_bar_ts or 0), int(cur_dt.timestamp()))
                         be_moved_count += 1
                         _log_event(
                             session,
@@ -530,11 +708,18 @@ def step_virtual_lifecycle(
                             {"new_stop_loss": new_sl},
                             created_at=cur_dt,
                         )
+                        dispatch_paper_notification(
+                            runtime,
+                            "lifecycle",
+                            f"Break-Even Stop: {trade.symbol}",
+                            [f"Moved SL to ${new_sl:.2f} ({cur_r:+.2f}R)."],
+                        )
                 else:
                     new_sl = round(max(mark_px + 0.01, min(trade.current_stop_loss, float(trade.entry_fill_price) - offset)), 2)
                     if new_sl < trade.current_stop_loss:
                         trade.current_stop_loss = new_sl
                         trade.be_moved = True
+                        trade.last_evaluated_bar_ts = max(int(trade.last_evaluated_bar_ts or 0), int(cur_dt.timestamp()))
                         be_moved_count += 1
                         _log_event(
                             session,
@@ -546,12 +731,49 @@ def step_virtual_lifecycle(
                             {"new_stop_loss": new_sl},
                             created_at=cur_dt,
                         )
+                        dispatch_paper_notification(
+                            runtime,
+                            "lifecycle",
+                            f"Break-Even Stop: {trade.symbol}",
+                            [f"Moved short SL to ${new_sl:.2f} ({cur_r:+.2f}R)."],
+                        )
+
+            # Trailing stop at live mark
+            cand_trail_live = _compute_trailing_stop_candidate(trade, mark_px, paper_cfg)
+            if cand_trail_live is not None:
+                trade.current_stop_loss = cand_trail_live
+                trade.be_moved = True
+                trade.trailing_active = True
+                trade.last_evaluated_bar_ts = max(int(trade.last_evaluated_bar_ts or 0), int(cur_dt.timestamp()))
+                trailing_moved_count += 1
+                _log_event(
+                    session,
+                    target_run.id,
+                    trade.id,
+                    trade.symbol,
+                    "SL_TRAILING",
+                    f"Trailed {trade.symbol} stop loss to ${cand_trail_live:.2f} ({cur_r:+.2f}R)",
+                    {"new_stop_loss": cand_trail_live, "cur_r": round(cur_r, 2)},
+                    created_at=cur_dt,
+                )
+                dispatch_paper_notification(
+                    runtime,
+                    "lifecycle",
+                    f"Trailing Stop Raised: {trade.symbol}",
+                    [f"Updated SL to ${cand_trail_live:.2f} ({cur_r:+.2f}R)."],
+                )
 
             # Earnings Exit Guard (close when earnings are <= 1 day away)
             dte = _current_days_to_earnings(session, trade.symbol, cur_dt)
             if dte is not None and 0 <= dte <= 1:
                 _close_trade(session, target_run, trade, mark_px, "EARNINGS_EXIT", cur_dt)
                 closed_count += 1
+                dispatch_paper_notification(
+                    runtime,
+                    "lifecycle",
+                    f"Earnings Exit: {trade.symbol}",
+                    [f"Closed before earnings ({dte}d) @ ${mark_px:.2f} | PnL ${trade.realized_pnl_usd:+.2f}"],
+                )
                 continue
 
             # Time Stop (release stagnant position after N business days below +0.5R)
@@ -561,17 +783,31 @@ def step_virtual_lifecycle(
                 if held_bdays >= time_stop_days and cur_r < 0.5:
                     _close_trade(session, target_run, trade, mark_px, "TIME_STOP", cur_dt)
                     closed_count += 1
+                    dispatch_paper_notification(
+                        runtime,
+                        "lifecycle",
+                        f"Time Stop Exit: {trade.symbol}",
+                        [f"Held {held_bdays} business days < +0.5R; closed @ ${mark_px:.2f} ({trade.r_multiple:+.2f}R)"],
+                    )
                     continue
 
     recompute_run_equity(session, target_run, now_utc=cur_dt)
-    check_kill_switch(session, target_run, paper_cfg, now_utc=cur_dt)
+    halted, halt_reason = check_kill_switch(session, target_run, paper_cfg, now_utc=cur_dt)
     session.commit()
+    if halted and not was_halted and target_run.kill_switch_triggered:
+        dispatch_paper_notification(
+            runtime,
+            "kill_switch",
+            "Kill-Switch Triggered",
+            [f"Run: {target_run.name}", f"Reason: {halt_reason}"],
+        )
     return {
         "run_id": target_run.id,
         "filled": filled_count,
         "expired": expired_count,
         "closed": closed_count,
         "be_moved": be_moved_count,
+        "trailing_moved": trailing_moved_count,
         "current_equity": target_run.current_equity,
     }
 
@@ -602,23 +838,43 @@ def run_paper_allocation_cycle(
                 return {"executed": False, "reason": "Paper trading is disabled."}
 
             mode = str(paper_cfg.get("mode", "virtual") or "virtual")
-            if mode != "virtual":
-                return {
-                    "executed": False,
-                    "reason": "IBKR Paper order execution is scheduled for Phase 2; switch mode to 'virtual' for Phase 1 simulation.",
-                }
+            if mode not in ("virtual", "ibkr_paper"):
+                return {"executed": False, "reason": f"Unsupported execution mode: {mode}"}
 
             run = ensure_active_paper_run(session, runtime, now_utc=cur_dt)
-            lifecycle_summary = step_virtual_lifecycle(
-                session,
-                run=run,
-                runtime_settings=runtime,
-                price_overrides=price_overrides,
-                now_utc=cur_dt,
-            )
+            if mode == "ibkr_paper":
+                from app.core.paper_ibkr import step_ibkr_paper_lifecycle, submit_ibkr_bracket_order
 
+                ibkr_cfg_chk = runtime.get("ibkr", {})
+                if not ibkr_cfg_chk.get("enabled", False):
+                    return {"executed": False, "reason": "IBKR Gateway is disabled in Settings."}
+                lifecycle_summary = step_ibkr_paper_lifecycle(
+                    session,
+                    run=run,
+                    runtime_settings=runtime,
+                    price_overrides=price_overrides,
+                    now_utc=cur_dt,
+                )
+            else:
+                lifecycle_summary = step_virtual_lifecycle(
+                    session,
+                    run=run,
+                    runtime_settings=runtime,
+                    price_overrides=price_overrides,
+                    now_utc=cur_dt,
+                )
+
+            was_halted = bool(run.kill_switch_triggered)
             blocked, block_reason = check_kill_switch(session, run, paper_cfg, now_utc=cur_dt)
             if blocked:
+                if not was_halted and run.kill_switch_triggered:
+                    session.commit()
+                    dispatch_paper_notification(
+                        runtime,
+                        "kill_switch",
+                        "Kill-Switch Triggered",
+                        [f"Run: {run.name}", f"Reason: {block_reason}"],
+                    )
                 return {
                     "executed": False,
                     "reason": block_reason,
@@ -629,8 +885,8 @@ def run_paper_allocation_cycle(
 
             ibkr_cfg = runtime.get("ibkr", {})
             live_fetcher = None
-            if price_overrides is None and ibkr_cfg.get("enabled", False):
-                live_fetcher = lambda syms: get_cached_live_quotes_ibkr(syms, ibkr_cfg)
+            if price_overrides is None:
+                live_fetcher = lambda syms: get_live_quotes_with_fallback(syms, ibkr_cfg)
 
             min_conv = float(paper_cfg.get("min_conviction", 68.0))
             min_rr = float(paper_cfg.get("min_rr", 1.8))
@@ -725,7 +981,169 @@ def run_paper_allocation_cycle(
                 ref_px = float(gate["ref_price"])
                 is_immediate = bool(gate["is_immediate"])
 
-                if is_immediate:
+                if mode == "ibkr_paper":
+                    try:
+                        ib_res = submit_ibkr_bracket_order(
+                            symbol=sym,
+                            direction=gate["direction"],
+                            quantity=qty,
+                            limit_price=limit_px,
+                            stop_loss=gate["stop_loss"],
+                            tp_price=gate["tp1"],
+                            ibkr_cfg=ibkr_cfg,
+                            expected_account=run.ibkr_account,
+                        )
+                    except Exception as exc:
+                        ib_res = {"ok": False, "error": str(exc)}
+
+                    if not ib_res.get("ok"):
+                        err_msg = str(ib_res.get("error") or "IBKR order submission failed")
+                        rejected.append({"symbol": sym, "direction": idea.get("direction"), "reason": err_msg})
+                        _log_event(
+                            session,
+                            run.id,
+                            None,
+                            sym,
+                            "ORDER_ERROR",
+                            f"[IBKR] Rejected {gate['direction']} {qty} {sym}: {err_msg}",
+                            {"limit_price": limit_px, "stop_loss": gate["stop_loss"], "tp1": gate["tp1"]},
+                            created_at=cur_dt,
+                        )
+                        continue
+
+                    du_acct = str(ib_res.get("account") or run.ibkr_account or "")
+                    if du_acct and run.ibkr_account != du_acct:
+                        run.ibkr_account = du_acct
+                    ib_filled_qty = int(ib_res.get("filled_qty") or 0)
+                    ib_fill_px = ib_res.get("avg_fill_price")
+                    is_ib_filled = ib_filled_qty > 0 and ib_fill_px
+
+                    if is_ib_filled:
+                        fill_px = round(float(ib_fill_px), 2)
+                        entry_notional = round(fill_px * ib_filled_qty, 2)
+                        run.cash_balance = round(float(run.cash_balance) - entry_notional, 2)
+                        risk_amt = round(abs(fill_px - float(gate["stop_loss"])) * ib_filled_qty, 2)
+                        slip_bps = _compute_slippage_bps(gate["direction"], limit_px, fill_px)
+                        trade = PaperTrade(
+                            run_id=run.id,
+                            symbol=sym,
+                            scan_run_id=idea.get("scan_run_id"),
+                            strategy_horizon="all",
+                            direction=gate["direction"],
+                            setup_name=str(idea.get("setup_name") or ""),
+                            status="OPEN",
+                            created_at=cur_dt,
+                            submitted_at=cur_dt,
+                            filled_at=cur_dt,
+                            last_evaluated_bar_ts=int(cur_dt.timestamp()),
+                            planned_entry_low=gate["entry_low"],
+                            planned_entry_high=gate["entry_high"],
+                            planned_limit_price=limit_px,
+                            planned_stop_loss=gate["stop_loss"],
+                            planned_tp1=gate["tp1"],
+                            planned_tp2=gate["tp2"],
+                            planned_rr=float(idea.get("risk_reward") or 0.0),
+                            current_stop_loss=gate["stop_loss"],
+                            atr_at_entry=atr_val,
+                            quantity_planned=qty,
+                            quantity_filled=ib_filled_qty,
+                            quantity_remaining=ib_filled_qty,
+                            entry_fill_price=fill_px,
+                            last_mark_price=fill_px,
+                            entry_slippage_bps=slip_bps,
+                            risk_amount_usd=risk_amt,
+                            unrealized_pnl_usd=0.0,
+                            ibkr_parent_order_id=ib_res.get("parent_order_id"),
+                            ibkr_stop_order_id=ib_res.get("stop_order_id"),
+                            ibkr_tp1_order_id=ib_res.get("tp1_order_id"),
+                            ibkr_perm_ids_json=json.dumps(ib_res.get("perm_ids") or []),
+                            conviction_at_entry=float(idea.get("conviction_score") or 0.0),
+                            composite_score_at_entry=float(idea.get("composite_score") or 0.0),
+                            market_regime_at_entry=market_regime,
+                            sector_at_entry=str(idea.get("sector") or ""),
+                            signals_at_entry_json=signals_json,
+                            plugin_scores_at_entry_json=json.dumps(plugin_scores),
+                        )
+                        session.add(trade)
+                        session.flush()
+                        _log_event(
+                            session,
+                            run.id,
+                            trade.id,
+                            sym,
+                            "ORDER_FILLED",
+                            f"[IBKR {du_acct}] Bracket {gate['direction']} {ib_filled_qty} {sym} filled @ ${fill_px:.2f} (SL ${gate['stop_loss']:.2f}, TP1 ${gate['tp1']:.2f})",
+                            {"parent_order_id": trade.ibkr_parent_order_id, "conviction": trade.conviction_at_entry},
+                            created_at=cur_dt,
+                        )
+                        dispatch_paper_notification(
+                            runtime,
+                            "orders",
+                            f"IBKR Order Filled: {gate['direction']} {sym}",
+                            [
+                                f"Account: {du_acct} · Qty: {ib_filled_qty} @ ${fill_px:.2f}",
+                                f"SL: ${gate['stop_loss']:.2f} · TP1: ${gate['tp1']:.2f} · Conv: {trade.conviction_at_entry:.0f}",
+                            ],
+                        )
+                    else:
+                        reserved = round(limit_px * qty, 2)
+                        run.cash_balance = round(float(run.cash_balance) - reserved, 2)
+                        trade = PaperTrade(
+                            run_id=run.id,
+                            symbol=sym,
+                            scan_run_id=idea.get("scan_run_id"),
+                            strategy_horizon="all",
+                            direction=gate["direction"],
+                            setup_name=str(idea.get("setup_name") or ""),
+                            status="PENDING_ENTRY",
+                            created_at=cur_dt,
+                            submitted_at=cur_dt,
+                            planned_entry_low=gate["entry_low"],
+                            planned_entry_high=gate["entry_high"],
+                            planned_limit_price=limit_px,
+                            planned_stop_loss=gate["stop_loss"],
+                            planned_tp1=gate["tp1"],
+                            planned_tp2=gate["tp2"],
+                            planned_rr=float(idea.get("risk_reward") or 0.0),
+                            current_stop_loss=gate["stop_loss"],
+                            atr_at_entry=atr_val,
+                            quantity_planned=qty,
+                            quantity_filled=0,
+                            quantity_remaining=0,
+                            risk_amount_usd=float(gate["risk_amount_usd"]),
+                            ibkr_parent_order_id=ib_res.get("parent_order_id"),
+                            ibkr_stop_order_id=ib_res.get("stop_order_id"),
+                            ibkr_tp1_order_id=ib_res.get("tp1_order_id"),
+                            ibkr_perm_ids_json=json.dumps(ib_res.get("perm_ids") or []),
+                            conviction_at_entry=float(idea.get("conviction_score") or 0.0),
+                            composite_score_at_entry=float(idea.get("composite_score") or 0.0),
+                            market_regime_at_entry=market_regime,
+                            sector_at_entry=str(idea.get("sector") or ""),
+                            signals_at_entry_json=signals_json,
+                            plugin_scores_at_entry_json=json.dumps(plugin_scores),
+                        )
+                        session.add(trade)
+                        session.flush()
+                        _log_event(
+                            session,
+                            run.id,
+                            trade.id,
+                            sym,
+                            "ORDER_SUBMITTED",
+                            f"[IBKR {du_acct}] Submitted Bracket {gate['direction']} {qty} {sym} LMT @ ${limit_px:.2f} (SL ${gate['stop_loss']:.2f}, TP1 ${gate['tp1']:.2f})",
+                            {"parent_order_id": trade.ibkr_parent_order_id, "conviction": trade.conviction_at_entry},
+                            created_at=cur_dt,
+                        )
+                        dispatch_paper_notification(
+                            runtime,
+                            "orders",
+                            f"IBKR Bracket Submitted: {gate['direction']} {sym}",
+                            [
+                                f"Account: {du_acct} · Qty: {qty} LMT @ ${limit_px:.2f}",
+                                f"SL: ${gate['stop_loss']:.2f} · TP1: ${gate['tp1']:.2f} · Conv: {trade.conviction_at_entry:.0f}",
+                            ],
+                        )
+                elif is_immediate:
                     fill_px = round(ref_px, 2)
                     entry_notional = round(fill_px * qty, 2)
                     run.cash_balance = round(float(run.cash_balance) - entry_notional, 2)
@@ -742,6 +1160,7 @@ def run_paper_allocation_cycle(
                         created_at=cur_dt,
                         submitted_at=cur_dt,
                         filled_at=cur_dt,
+                        last_evaluated_bar_ts=int(cur_dt.timestamp()),
                         planned_entry_low=gate["entry_low"],
                         planned_entry_high=gate["entry_high"],
                         planned_limit_price=limit_px,
@@ -777,6 +1196,15 @@ def run_paper_allocation_cycle(
                         f"Opened {gate['direction']} {qty} {sym} @ ${fill_px:.2f} (SL ${gate['stop_loss']:.2f}, TP1 ${gate['tp1']:.2f})",
                         {"conviction": trade.conviction_at_entry, "risk_usd": risk_amt, "slippage_bps": slip_bps},
                         created_at=cur_dt,
+                    )
+                    dispatch_paper_notification(
+                        runtime,
+                        "orders",
+                        f"Virtual Trade Opened: {gate['direction']} {sym}",
+                        [
+                            f"Qty: {qty} @ ${fill_px:.2f} (Conv {trade.conviction_at_entry:.0f})",
+                            f"SL: ${gate['stop_loss']:.2f} · TP1: ${gate['tp1']:.2f} · Risk ${risk_amt:.0f}",
+                        ],
                     )
                 else:
                     reserved = round(limit_px * qty, 2)
@@ -822,6 +1250,15 @@ def run_paper_allocation_cycle(
                         f"Submitted {gate['direction']} limit {qty} {sym} @ ${limit_px:.2f} (SL ${gate['stop_loss']:.2f}, TP1 ${gate['tp1']:.2f})",
                         {"conviction": trade.conviction_at_entry, "reserved_usd": reserved},
                         created_at=cur_dt,
+                    )
+                    dispatch_paper_notification(
+                        runtime,
+                        "orders",
+                        f"Virtual Limit Submitted: {gate['direction']} {sym}",
+                        [
+                            f"Qty: {qty} @ ${limit_px:.2f} (Conv {trade.conviction_at_entry:.0f})",
+                            f"SL: ${gate['stop_loss']:.2f} · TP1: ${gate['tp1']:.2f}",
+                        ],
                     )
 
                 opened.append(
@@ -882,8 +1319,24 @@ def close_paper_trade_manually(
     run = session.get(PaperAccountRun, trade.run_id)
     if run is None:
         return None
+    runtime = load_runtime_settings(session)
+    ibkr_cfg = runtime.get("ibkr", {})
 
     if trade.status == "PENDING_ENTRY":
+        if run.mode == "ibkr_paper" and price_override is None and ibkr_cfg.get("enabled", False):
+            from app.core.paper_ibkr import close_ibkr_trade
+
+            close_ibkr_trade(
+                symbol=trade.symbol,
+                direction=trade.direction,
+                quantity=int(trade.quantity_planned),
+                parent_order_id=trade.ibkr_parent_order_id,
+                stop_order_id=trade.ibkr_stop_order_id,
+                tp1_order_id=trade.ibkr_tp1_order_id,
+                is_pending=True,
+                ibkr_cfg=ibkr_cfg,
+                expected_account=run.ibkr_account,
+            )
         reserved = round(float(trade.planned_limit_price) * int(trade.quantity_planned), 2)
         run.cash_balance = round(float(run.cash_balance) + reserved, 2)
         trade.status = "CANCELLED"
@@ -900,14 +1353,34 @@ def close_paper_trade_manually(
         )
     elif trade.status in ("OPEN", "PARTIAL_TP1"):
         exit_px = price_override
+        if exit_px is None and run.mode == "ibkr_paper" and ibkr_cfg.get("enabled", False):
+            from app.core.paper_ibkr import close_ibkr_trade
+
+            ib_res = close_ibkr_trade(
+                symbol=trade.symbol,
+                direction=trade.direction,
+                quantity=int(trade.quantity_remaining or trade.quantity_filled),
+                parent_order_id=trade.ibkr_parent_order_id,
+                stop_order_id=trade.ibkr_stop_order_id,
+                tp1_order_id=trade.ibkr_tp1_order_id,
+                is_pending=False,
+                ibkr_cfg=ibkr_cfg,
+                expected_account=run.ibkr_account,
+            )
+            if ib_res.get("fill_price"):
+                exit_px = float(ib_res["fill_price"])
         if exit_px is None:
-            runtime = load_runtime_settings(session)
-            ibkr_cfg = runtime.get("ibkr", {})
-            quotes = get_cached_live_quotes_ibkr([trade.symbol], ibkr_cfg) if ibkr_cfg.get("enabled") else {}
+            quotes = get_live_quotes_with_fallback([trade.symbol], ibkr_cfg)
             exit_px = _latest_mark_price(session, trade.symbol, quotes_map=quotes)
         if exit_px is None:
             exit_px = float(trade.last_mark_price or trade.entry_fill_price or trade.planned_limit_price)
         _close_trade(session, run, trade, float(exit_px), "MANUAL_CLOSE", cur_dt)
+        dispatch_paper_notification(
+            runtime,
+            "orders",
+            f"Manually Closed: {trade.symbol}",
+            [f"Exit @ ${float(exit_px):.2f} | PnL ${trade.realized_pnl_usd:+.2f} ({trade.r_multiple:+.2f}R)"],
+        )
 
     recompute_run_equity(session, run, now_utc=cur_dt)
     session.commit()
@@ -924,7 +1397,8 @@ def set_paper_kill_switch(
     now_utc: datetime | None = None,
 ) -> PaperAccountRun:
     cur_dt = as_utc(now_utc) or utcnow()
-    run = ensure_active_paper_run(session, now_utc=cur_dt)
+    runtime = load_runtime_settings(session)
+    run = ensure_active_paper_run(session, runtime, now_utc=cur_dt)
     if halt:
         run.kill_switch_triggered = True
         run.kill_switch_reason = reason or "Emergency stop triggered manually."
@@ -947,6 +1421,12 @@ def set_paper_kill_switch(
             for t in active:
                 px = (price_overrides or {}).get(t.symbol) if price_overrides else None
                 close_paper_trade_manually(session, t.id, price_override=px, now_utc=cur_dt)
+        dispatch_paper_notification(
+            runtime,
+            "kill_switch",
+            "Emergency Kill-Switch Activated",
+            [f"Run: {run.name}", f"Reason: {run.kill_switch_reason}", f"Closed all positions: {close_all}"],
+        )
     else:
         run.kill_switch_triggered = False
         run.kill_switch_reason = ""
@@ -959,6 +1439,12 @@ def set_paper_kill_switch(
             "KILL_SWITCH_RESUMED",
             "Paper trading resumed manually.",
             created_at=cur_dt,
+        )
+        dispatch_paper_notification(
+            runtime,
+            "kill_switch",
+            "Paper Trading Resumed",
+            [f"Run: {run.name} resumed autonomous entries."],
         )
 
     recompute_run_equity(session, run, now_utc=cur_dt)

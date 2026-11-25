@@ -344,9 +344,40 @@ export interface PaperTradingSettings {
   max_spread_pct: number;
   min_days_to_earnings: number;
   move_to_be_at_r: number;
+  trailing_stop_enabled?: boolean;
+  trailing_activation_r?: number;
+  trailing_atr_mult?: number;
   time_stop_days: number;
   daily_loss_limit_pct: number;
   max_drawdown_pct: number;
+}
+
+export interface IbkrPaperStatus {
+  connected: boolean;
+  paper_verified: boolean;
+  account: string;
+  open_orders_count: number;
+  positions_count: number;
+  net_liquidation: number | null;
+  currency: string;
+  message: string;
+}
+
+export interface TelegramDetectChat {
+  chat_id: string;
+  type: string;
+  label: string;
+  username: string;
+  last_text: string;
+}
+
+export interface TelegramDetectResponse {
+  ok: boolean;
+  bot_username?: string;
+  bot_name?: string;
+  suggested_chat_id?: string;
+  chats: TelegramDetectChat[];
+  message: string;
 }
 
 export interface RuntimeSettings {
@@ -368,11 +399,23 @@ export interface RuntimeSettings {
     prefer_ibkr_history: boolean;
   };
   data_sources: { finnhub_api_key: string; sec_user_agent: string };
-  schedule: { enabled: boolean; timezone: string; post_market_time: string; pre_market_time: string };
+  schedule: {
+    enabled: boolean;
+    timezone: string;
+    post_market_time: string;
+    pre_market_time: string;
+    intraday_enabled?: boolean;
+    intraday_times?: string;
+  };
   notifiers: {
     telegram_enabled: boolean;
     telegram_bot_token: string;
     telegram_chat_id: string;
+    telegram_notify_scan?: boolean;
+    telegram_notify_paper_orders?: boolean;
+    telegram_notify_paper_lifecycle?: boolean;
+    telegram_notify_kill_switch?: boolean;
+    telegram_commands_enabled?: boolean;
     discord_enabled: boolean;
     discord_webhook_url: string;
     min_alert_score: number;
@@ -464,6 +507,10 @@ export interface PaperTrade {
   planned_tp2: number;
   planned_rr: number;
   be_moved: boolean;
+  trailing_active?: boolean;
+  ibkr_parent_order_id?: number | null;
+  ibkr_stop_order_id?: number | null;
+  ibkr_tp1_order_id?: number | null;
   quantity_planned: number;
   quantity_filled: number;
   quantity_remaining: number;

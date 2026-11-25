@@ -14,6 +14,7 @@ from app.core.paper_analytics import (
     serialize_paper_event,
     serialize_paper_trade,
 )
+from app.core.paper_ibkr import probe_ibkr_paper_account, step_ibkr_paper_lifecycle
 from app.core.paper_risk import ensure_active_paper_run
 from app.core.paper_virtual import (
     close_paper_trade_manually,
@@ -23,7 +24,7 @@ from app.core.paper_virtual import (
     step_virtual_lifecycle,
 )
 from app.db.database import get_db
-from app.db.models import PaperAccountRun, PaperOrderEvent, PaperTrade
+from app.db.models import PaperAccountRun, PaperOrderEvent, PaperTrade, load_runtime_settings
 
 router = APIRouter(prefix="/paper", tags=["paper_trading"])
 
@@ -142,8 +143,48 @@ def evaluate_now() -> dict[str, Any]:
 
 @router.post("/step")
 def step_lifecycle_now(db: Session = Depends(get_db)) -> dict[str, Any]:
-    res = step_virtual_lifecycle(db)
+    runtime = load_runtime_settings(db)
+    run = ensure_active_paper_run(db, runtime)
+    if run.mode == "ibkr_paper":
+        res = step_ibkr_paper_lifecycle(db, run=run, runtime_settings=runtime)
+    else:
+        res = step_virtual_lifecycle(db, run=run, runtime_settings=runtime)
     return {"step": res, "overview": build_paper_overview(db, run_id=res["run_id"])}
+
+
+@router.get("/ibkr-status")
+def get_ibkr_paper_status(db: Session = Depends(get_db)) -> dict[str, Any]:
+    runtime = load_runtime_settings(db)
+    ibkr_cfg = runtime.get("ibkr", {})
+    if not ibkr_cfg.get("enabled", False):
+        return {
+            "connected": False,
+            "paper_verified": False,
+            "account": "",
+            "open_orders_count": 0,
+            "positions_count": 0,
+            "net_liquidation": None,
+            "currency": "USD",
+            "message": "IBKR Gateway is disabled in Settings.",
+        }
+    return probe_ibkr_paper_account(
+        str(ibkr_cfg.get("host", "127.0.0.1")),
+        int(ibkr_cfg.get("port", 4002)),
+        int(ibkr_cfg.get("client_id", 17)),
+    )
+
+
+@router.post("/reconcile")
+def reconcile_ibkr_now(db: Session = Depends(get_db)) -> dict[str, Any]:
+    runtime = load_runtime_settings(db)
+    run = ensure_active_paper_run(db, runtime)
+    if run.mode != "ibkr_paper":
+        return {
+            "reconcile": {"reconciled": False, "reason": "Active run is in Virtual mode; switch mode to IBKR Paper first."},
+            "overview": build_paper_overview(db, run_id=run.id),
+        }
+    res = step_ibkr_paper_lifecycle(db, run=run, runtime_settings=runtime)
+    return {"reconcile": res, "overview": build_paper_overview(db, run_id=run.id)}
 
 
 @router.post("/trades/{trade_id}/close")

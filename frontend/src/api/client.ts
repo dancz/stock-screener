@@ -1,6 +1,7 @@
 import type {
   BackfillStatus,
   CandleBar,
+  IbkrPaperStatus,
   LiveQuote,
   PaperAccountRun,
   PaperAttribution,
@@ -14,6 +15,7 @@ import type {
   ScreenerResponse,
   SortBy,
   StockDetail,
+  TelegramDetectResponse,
   TradeIdeaHorizon,
   TradeIdeasResponse,
   Watchlist,
@@ -194,6 +196,21 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ plugin_id: pluginId }),
     });
+  },
+
+  detectTelegramChat(botToken: string): Promise<TelegramDetectResponse> {
+    return request("/api/settings/telegram/detect-chat", {
+      method: "POST",
+      body: JSON.stringify({ bot_token: botToken }),
+    });
+  },
+
+  getPaperIbkrStatus(): Promise<IbkrPaperStatus> {
+    return request("/api/paper/ibkr-status");
+  },
+
+  reconcilePaperIbkr(): Promise<{ reconcile: Record<string, unknown>; overview: PaperOverview }> {
+    return request("/api/paper/reconcile", { method: "POST" });
   },
 
   getPaperOverview(runId?: number | null): Promise<PaperOverview> {

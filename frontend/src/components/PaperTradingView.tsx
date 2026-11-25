@@ -12,6 +12,7 @@ import {
   PlusCircle,
   Power,
   RefreshCw,
+  Send,
   ShieldAlert,
   ShieldCheck,
   TrendingDown,
@@ -125,7 +126,11 @@ function AttributionTable({ title, rows }: { title: string; rows: PaperAttributi
   );
 }
 
-export const PaperTradingView: React.FC = () => {
+interface PaperTradingViewProps {
+  onOpenTelegramSetup?: () => void;
+}
+
+export const PaperTradingView: React.FC<PaperTradingViewProps> = ({ onOpenTelegramSetup }) => {
   const openIdeaInScreener = useScreenerStore((s) => s.openIdeaInScreener);
   const refreshPaperSummary = useScreenerStore((s) => s.refreshPaperSummary);
   const updateSettings = useScreenerStore((s) => s.updateSettings);
@@ -300,8 +305,31 @@ export const PaperTradingView: React.FC = () => {
       const res = await api.stepPaperLifecycle();
       const s = res.step as Record<string, number>;
       setBannerMsg(
-        `Lifecycle step complete: filled=${s.filled ?? 0}, closed=${s.closed ?? 0}, BE moved=${s.be_moved ?? 0}, expired=${s.expired ?? 0}.`
+        `Lifecycle step complete: filled=${s.filled ?? 0}, closed=${s.closed ?? 0}, BE moved=${s.be_moved ?? 0}, trailing=${s.trailing_moved ?? 0}, expired=${s.expired ?? 0}.`
       );
+      await Promise.all([loadAll(), refreshPaperSummary()]);
+    } catch (err) {
+      setBannerMsg((err as Error).message);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleSyncIbkr = async () => {
+    setBusyAction("reconcile");
+    setBannerMsg(null);
+    try {
+      const res = await api.reconcilePaperIbkr();
+      const rec = res.reconcile as Record<string, unknown>;
+      if (rec.reconciled) {
+        setBannerMsg(
+          `Synced IBKR ${String(rec.account ?? "")}: filled=${Number(rec.filled ?? 0)}, closed=${Number(
+            rec.closed ?? 0
+          )}, BE=${Number(rec.be_moved ?? 0)}, trailing=${Number(rec.trailing_moved ?? 0)}.`
+        );
+      } else {
+        setBannerMsg(String(rec.reason ?? "IBKR reconciliation skipped."));
+      }
       await Promise.all([loadAll(), refreshPaperSummary()]);
     } catch (err) {
       setBannerMsg((err as Error).message);
@@ -326,7 +354,8 @@ export const PaperTradingView: React.FC = () => {
   };
 
   const handleCloseTrade = async (tradeId: number, symbol: string) => {
-    if (!window.confirm(`Close virtual paper position for ${symbol} at current mark price?`)) return;
+    const modeLabel = overview?.run.mode === "ibkr_paper" ? "IBKR Paper" : "virtual paper";
+    if (!window.confirm(`Close ${modeLabel} position for ${symbol} at current market/mark price?`)) return;
     setBusyAction(`close_${tradeId}`);
     try {
       await api.closePaperTrade(tradeId);
@@ -403,7 +432,11 @@ export const PaperTradingView: React.FC = () => {
             <div className="flex items-center gap-2">
               <h1 className="text-base font-bold text-white">Autonomous Paper Trading</h1>
               <span className="rounded-full border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-sky-300">
-                {r?.mode === "ibkr_paper" ? "IBKR PAPER DU*" : "VIRTUAL SIMULATOR (READ-ONLY)"}
+                {r?.mode === "ibkr_paper"
+                  ? r.ibkr_account
+                    ? `IBKR PAPER · ${r.ibkr_account}`
+                    : "IBKR PAPER DU*"
+                  : "VIRTUAL SIMULATOR (READ-ONLY)"}
               </span>
               {r?.kill_switch_triggered ? (
                 <span className="inline-flex items-center gap-1 rounded-full border border-rose-500/50 bg-rose-500/15 px-2 py-0.5 text-[10px] font-bold text-rose-300">
@@ -484,6 +517,40 @@ export const PaperTradingView: React.FC = () => {
                 <RefreshCw className={`h-3.5 w-3.5 ${busyAction === "step" ? "animate-spin" : ""}`} />
                 <span>Update Marks</span>
               </button>
+
+              {r?.mode === "ibkr_paper" && (
+                <button
+                  type="button"
+                  onClick={handleSyncIbkr}
+                  disabled={busyAction !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/15 px-2.5 py-1.5 text-xs font-semibold text-sky-200 hover:bg-sky-500/25"
+                  title="Reconcile fills, positions, and protective stops with IBKR Gateway"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${busyAction === "reconcile" ? "animate-spin" : ""}`} />
+                  <span>Sync IBKR</span>
+                </button>
+              )}
+
+              {onOpenTelegramSetup && (
+                <button
+                  type="button"
+                  onClick={onOpenTelegramSetup}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs font-semibold text-slate-200 hover:border-sky-500/60"
+                  title="Configure Telegram Bot notifications & interactive commands"
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      settings?.notifiers?.telegram_enabled &&
+                      settings.notifiers.telegram_bot_token &&
+                      settings.notifiers.telegram_chat_id
+                        ? "bg-emerald-400"
+                        : "bg-slate-500"
+                    }`}
+                  />
+                  <Send className="h-3.5 w-3.5 text-sky-400" />
+                  <span>Telegram Bot</span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -730,7 +797,8 @@ export const PaperTradingView: React.FC = () => {
                         </span>
                         <div className="mt-0.5 text-[10px] font-medium text-slate-400">
                           {t.status}
-                          {t.be_moved ? " · BE Protected" : ""}
+                          {t.trailing_active ? " · Trailing" : t.be_moved ? " · BE Protected" : ""}
+                          {t.ibkr_parent_order_id ? ` · IBKR #${t.ibkr_parent_order_id}` : ""}
                         </div>
                       </td>
                       <td className="px-2 py-2.5 text-right tabular-nums text-slate-200">{t.quantity_planned}</td>

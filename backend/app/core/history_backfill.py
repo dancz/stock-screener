@@ -56,6 +56,12 @@ def get_backfill_status() -> dict[str, Any]:
     return status
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def _period_to_ibkr_duration(period: str, fallback: str) -> str:
     p = period.strip().lower()
     if p.endswith("y"):
@@ -99,10 +105,11 @@ def run_history_backfill_batch(max_symbols: int | None = None, force: bool = Fal
                 if tk.symbol.startswith("^"):
                     continue
                 is_wl = 0 if tk.symbol in watchlist_syms else 1
-                if tk.history_backfilled_at is None:
+                hb_dt = _as_utc(tk.history_backfilled_at)
+                if hb_dt is None:
                     candidates.append((is_wl, 0.0, tk))
-                elif force or tk.history_backfilled_at < stale_cutoff:
-                    candidates.append((is_wl + 2, tk.history_backfilled_at.timestamp(), tk))
+                elif force or hb_dt < stale_cutoff:
+                    candidates.append((is_wl + 2, hb_dt.timestamp(), tk))
 
             candidates.sort(key=lambda item: (item[0], item[1]))
             selected = [item[2] for item in candidates[:batch_size]]

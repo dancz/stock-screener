@@ -196,6 +196,8 @@ class PaperTrade(Base):
     current_stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
     atr_at_entry: Mapped[float] = mapped_column(Float, default=0.0)
     be_moved: Mapped[bool] = mapped_column(Boolean, default=False)
+    trailing_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_evaluated_bar_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quantity_planned: Mapped[int] = mapped_column(Integer, default=0)
     quantity_filled: Mapped[int] = mapped_column(Integer, default=0)
     quantity_remaining: Mapped[int] = mapped_column(Integer, default=0)
@@ -278,6 +280,8 @@ def init_db(db_session: Session | None = None) -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_column(engine, "tickers", "history_backfilled_at", "DATETIME")
     _ensure_column(engine, "watchlists", "horizon", "VARCHAR(24) DEFAULT 'general'")
+    _ensure_column(engine, "paper_trades", "trailing_active", "BOOLEAN DEFAULT 0")
+    _ensure_column(engine, "paper_trades", "last_evaluated_bar_ts", "INTEGER")
 
     from app.db.database import SessionLocal
 

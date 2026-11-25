@@ -6,10 +6,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
-from app.core import pipeline
+from app.core import pipeline, telegram_bot
 from app.core.paper_analytics import build_paper_overview, build_signal_attribution, export_trades_csv
+from app.core.paper_ibkr import LiveAccountBlockedError, assert_paper_account, reconcile_ibkr_state
 from app.core.paper_risk import check_kill_switch, ensure_active_paper_run, evaluate_candidate_gate
 from app.core.paper_virtual import (
     run_paper_allocation_cycle,
@@ -19,11 +21,13 @@ from app.core.paper_virtual import (
 from app.db.database import configure_database, session_scope
 from app.db.models import (
     AnalysisSnapshot,
+    Candle,
     PaperTrade,
     ScanRun,
     Ticker,
     init_db,
     load_runtime_settings,
+    save_runtime_settings,
 )
 from app.main import app
 
@@ -460,3 +464,293 @@ def test_paper_analytics_attribution_csv_and_api(tmp_path: Path):
         assert reset_resp.status_code == 200
         assert reset_resp.json()["run"]["initial_capital"] == 50000.0
         assert len(client.get("/api/paper/runs").json()["runs"]) == 2
+
+
+def test_virtual_be_does_not_retroactively_stop_on_earlier_bar_and_trails(tmp_path: Path):
+    configure_database(tmp_path / "paper_be_trail.db")
+    init_db()
+    t0 = datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+
+    with session_scope() as session:
+        run = ensure_active_paper_run(session, now_utc=t0)
+        pipeline._ensure_ticker_row(session, "LMT", name="Lockheed Martin", sector="Industrials")
+        # Entry 585.88, SL 569.69 (risk/sh = 16.19), TP1 635.00, ATR 8.0
+        tr = PaperTrade(
+            run_id=run.id,
+            symbol="LMT",
+            direction="LONG",
+            status="OPEN",
+            created_at=t0,
+            submitted_at=t0,
+            filled_at=t0,
+            planned_entry_low=582.0,
+            planned_entry_high=586.0,
+            planned_limit_price=585.88,
+            planned_stop_loss=569.69,
+            current_stop_loss=569.69,
+            planned_tp1=635.0,
+            planned_tp2=650.0,
+            atr_at_entry=8.0,
+            quantity_planned=6,
+            quantity_filled=6,
+            quantity_remaining=6,
+            entry_fill_price=585.88,
+            last_mark_price=585.88,
+            risk_amount_usd=round((585.88 - 569.69) * 6, 2),
+        )
+        run.cash_balance -= round(585.88 * 6, 2)
+        session.add(tr)
+
+        # Seed early dip bar (t0+1h, low=582.92 > initial SL) and later BE-trigger bar (t0+4h, high=603.0 > +1R)
+        bar1_ts = int((t0 + timedelta(hours=1)).timestamp())
+        bar2_ts = int((t0 + timedelta(hours=4)).timestamp())
+        session.add_all(
+            [
+                Candle(symbol="LMT", timeframe="1h", ts=bar1_ts, open=586.0, high=587.0, low=582.92, close=585.0, volume=1e6),
+                Candle(symbol="LMT", timeframe="1h", ts=bar2_ts, open=586.0, high=603.0, low=585.5, close=601.0, volume=1e6),
+            ]
+        )
+        session.commit()
+
+        # Tick 1 evaluates bar1 & bar2 -> moves SL to BE (> 586), sets last_evaluated_bar_ts = bar2_ts
+        step_virtual_lifecycle(session, run=run, price_overrides={"LMT": 601.0}, now_utc=t0 + timedelta(hours=4, minutes=5))
+        session.refresh(tr)
+        assert tr.status == "OPEN"
+        assert tr.be_moved is True
+        assert tr.current_stop_loss > 586.0
+        assert tr.last_evaluated_bar_ts == bar2_ts
+
+        # Tick 2 right after must NOT replay bar1 (low 582.92) against tightened BE stop!
+        step_virtual_lifecycle(session, run=run, price_overrides={"LMT": 601.0}, now_utc=t0 + timedelta(hours=4, minutes=10))
+        session.refresh(tr)
+        assert tr.status == "OPEN"
+
+        # Bar 3 pushes high to 616.0 (+1.86R >= 1.5R activation) -> Trailing Stop rises to 616 - 2*8 = 600.0
+        bar3_ts = int((t0 + timedelta(hours=5)).timestamp())
+        session.add(
+            Candle(symbol="LMT", timeframe="1h", ts=bar3_ts, open=601.0, high=616.0, low=600.5, close=612.0, volume=1e6)
+        )
+        session.commit()
+        step_virtual_lifecycle(session, run=run, price_overrides={"LMT": 612.0}, now_utc=t0 + timedelta(hours=5, minutes=5))
+        session.refresh(tr)
+        assert tr.status == "OPEN"
+        assert tr.trailing_active is True
+        assert tr.current_stop_loss == 600.0
+
+        # Bar 4 pulls back through trailing stop 600.0 -> exits as TRAILING_STOP with positive profit
+        bar4_ts = int((t0 + timedelta(hours=6)).timestamp())
+        session.add(
+            Candle(symbol="LMT", timeframe="1h", ts=bar4_ts, open=611.0, high=612.0, low=595.0, close=597.0, volume=1e6)
+        )
+        session.commit()
+        step_virtual_lifecycle(session, run=run, price_overrides={"LMT": 597.0}, now_utc=t0 + timedelta(hours=6, minutes=5))
+        session.refresh(tr)
+        assert tr.status == "CLOSED"
+        assert tr.exit_reason == "TRAILING_STOP"
+        assert tr.realized_pnl_usd > 0
+
+
+def test_ibkr_paper_safety_lock_blocks_live_ports_and_accounts():
+    with pytest.raises(LiveAccountBlockedError):
+        assert_paper_account(["U1234567"], 4002)
+    with pytest.raises(LiveAccountBlockedError):
+        assert_paper_account(["F987654"], 4002)
+    with pytest.raises(LiveAccountBlockedError):
+        assert_paper_account([], 4002)
+    with pytest.raises(LiveAccountBlockedError):
+        assert_paper_account(["DUK527861"], 4001)
+    with pytest.raises(LiveAccountBlockedError):
+        assert_paper_account(["DUK527861"], 7496)
+    with pytest.raises(LiveAccountBlockedError):
+        assert_paper_account(["DUK527861", "U9999999"], 4002)
+
+    assert assert_paper_account(["DUK527861"], 4002) == "DUK527861"
+    assert assert_paper_account(["DUK527861"], 7497) == "DUK527861"
+
+
+def test_ibkr_paper_reconcile_and_mode_isolation(tmp_path: Path):
+    configure_database(tmp_path / "paper_ibkr_rec.db")
+    init_db()
+    t0 = datetime(2026, 11, 25, 16, 0, tzinfo=timezone.utc)
+
+    with session_scope() as session:
+        rt = load_runtime_settings(session)
+        v_run = ensure_active_paper_run(session, rt, now_utc=t0)
+        assert v_run.mode == "virtual"
+        pipeline._ensure_ticker_row(session, "AAPL", name="Apple")
+        session.add(
+            PaperTrade(
+                run_id=v_run.id,
+                symbol="AAPL",
+                direction="LONG",
+                status="CLOSED",
+                planned_limit_price=200.0,
+                quantity_planned=5,
+                realized_pnl_usd=25.0,
+            )
+        )
+        session.commit()
+
+        # Switching mode while virtual run has trades archives virtual run and creates isolated ibkr_paper run
+        rt["paper_trading"]["mode"] = "ibkr_paper"
+        save_runtime_settings(session, rt)
+        ib_run = ensure_active_paper_run(session, rt, now_utc=t0)
+        session.refresh(v_run)
+        assert v_run.is_active is False
+        assert ib_run.id != v_run.id
+        assert ib_run.mode == "ibkr_paper"
+
+        # Seed PENDING_ENTRY linked to IBKR order IDs
+        ib_run.cash_balance -= 2000.0
+        tr = PaperTrade(
+            run_id=ib_run.id,
+            symbol="AAPL",
+            direction="LONG",
+            status="PENDING_ENTRY",
+            created_at=t0,
+            submitted_at=t0,
+            planned_entry_low=199.0,
+            planned_entry_high=201.0,
+            planned_limit_price=200.0,
+            planned_stop_loss=190.0,
+            current_stop_loss=190.0,
+            planned_tp1=220.0,
+            planned_tp2=230.0,
+            quantity_planned=10,
+            ibkr_parent_order_id=101,
+            ibkr_stop_order_id=102,
+            ibkr_tp1_order_id=103,
+            risk_amount_usd=100.0,
+        )
+        session.add(tr)
+        session.commit()
+
+        # Reconcile entry fill + $1.00 commission + protective SL verified open
+        snap_fill = {
+            "account": "DUK527861",
+            "open_orders": [
+                {"order_id": 102, "symbol": "AAPL", "action": "SELL", "order_type": "STP", "aux_price": 190.0},
+                {"order_id": 103, "symbol": "AAPL", "action": "SELL", "order_type": "LMT", "lmt_price": 220.0},
+            ],
+            "positions": {"AAPL": {"quantity": 10.0, "avg_cost": 199.5}},
+            "executions": [
+                {"order_id": 101, "symbol": "AAPL", "side": "BOT", "shares": 10.0, "price": 199.5, "commission": 1.0}
+            ],
+        }
+        rec1 = reconcile_ibkr_state(session, run=ib_run, runtime_settings=rt, now_utc=t0 + timedelta(minutes=5), snapshot_override=snap_fill)
+        session.refresh(tr)
+        session.refresh(ib_run)
+        assert rec1["filled"] == 1
+        assert ib_run.ibkr_account == "DUK527861"
+        assert tr.status == "OPEN"
+        assert tr.entry_fill_price == 199.5
+        assert tr.commission_usd == 1.0
+
+        # Reconcile exit via stop-loss execution
+        snap_exit = {
+            "account": "DUK527861",
+            "open_orders": [],
+            "positions": {},
+            "executions": [
+                {"order_id": 102, "symbol": "AAPL", "side": "SLD", "shares": 10.0, "price": 190.0, "commission": 1.0}
+            ],
+        }
+        rec2 = reconcile_ibkr_state(session, run=ib_run, runtime_settings=rt, now_utc=t0 + timedelta(minutes=30), snapshot_override=snap_exit)
+        session.refresh(tr)
+        assert rec2["closed"] == 1
+        assert tr.status == "CLOSED"
+        assert tr.exit_reason == "STOP_LOSS"
+        assert tr.exit_fill_price == 190.0
+        assert tr.commission_usd == 2.0
+        assert tr.realized_pnl_usd == -97.0
+
+
+def test_telegram_detect_chat_and_authorized_commands(tmp_path: Path, monkeypatch):
+    configure_database(tmp_path / "paper_tg.db")
+    init_db()
+
+    sent_messages: list[dict] = []
+    poll_responses: list[dict] = [
+        {"ok": True, "result": [{"update_id": 10, "message": {"chat": {"id": 999001, "type": "private", "username": "trader"}, "text": "/start"}}]},
+        {
+            "ok": True,
+            "result": [
+                {"update_id": 11, "message": {"chat": {"id": 888888, "type": "private", "username": "stranger"}, "text": "/halt"}},
+                {"update_id": 12, "message": {"chat": {"id": 999001, "type": "private", "username": "trader"}, "text": "/status"}},
+                {"update_id": 13, "message": {"chat": {"id": 999001, "type": "private", "username": "trader"}, "text": "/halt"}},
+            ],
+        },
+    ]
+
+    class _FakeResp:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url: str, params=None):
+            if url.endswith("/getMe"):
+                return _FakeResp(200, {"ok": True, "result": {"username": "swingpulse_test_bot", "first_name": "SwingPulse"}})
+            if url.endswith("/getUpdates"):
+                if params and params.get("offset") is not None and len(poll_responses) > 1:
+                    return _FakeResp(200, poll_responses.pop(0))
+                return _FakeResp(200, poll_responses[0])
+            return _FakeResp(404, {})
+
+        def post(self, url: str, json=None):
+            sent_messages.append({"url": url, "json": json})
+            return _FakeResp(200, {"ok": True, "result": {"message_id": len(sent_messages)}})
+
+    monkeypatch.setattr(telegram_bot.httpx, "Client", _FakeClient)
+    telegram_bot._last_update_id = None
+    telegram_bot._active_token = ""
+
+    det = telegram_bot.detect_telegram_chats("123:testtok")
+    assert det["ok"] is True
+    assert det["bot_username"] == "swingpulse_test_bot"
+    assert det["suggested_chat_id"] == "999001"
+
+    with session_scope() as session:
+        rt = load_runtime_settings(session)
+        rt["notifiers"].update(
+            {
+                "telegram_enabled": True,
+                "telegram_bot_token": "123:testtok",
+                "telegram_chat_id": "999001",
+                "telegram_commands_enabled": True,
+            }
+        )
+        save_runtime_settings(session, rt)
+
+    # First poll only primes offset past historical /start update_id=10
+    p1 = telegram_bot.poll_telegram_commands_once()
+    assert p1["primed"] is True and p1["processed"] == 0
+
+    # Consume initial poll payload and poll authorized/unauthorized batch
+    poll_responses.pop(0)
+    p2 = telegram_bot.poll_telegram_commands_once()
+    assert p2["processed"] == 2
+    # 2 command replies (/status + /halt) + 1 Kill-Switch broadcast alert via NotifierPlugin
+    assert len(sent_messages) == 3
+    assert all(str(m["json"]["chat_id"]) == "999001" for m in sent_messages)
+    texts = [m["json"]["text"] for m in sent_messages]
+    assert any("Experiment #1" in t for t in texts)
+    assert any("Emergency Kill-Switch Activated" in t for t in texts)
+    assert any("Kill-Switch Activated" in t for t in texts)
+
+    with session_scope() as session:
+        run = ensure_active_paper_run(session)
+        assert run.kill_switch_triggered is True

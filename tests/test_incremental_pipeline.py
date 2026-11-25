@@ -353,3 +353,46 @@ def test_prune_old_snapshots(tmp_path: Path):
         rem_msft = session.query(AnalysisSnapshot).filter(AnalysisSnapshot.symbol == "MSFT").count()
         assert rem_aapl == aapl_ids[-5:]
         assert rem_msft == 3
+
+
+def test_history_backfill_handles_naive_sqlite_datetime(tmp_path: Path, monkeypatch):
+    from app.core import history_backfill
+    from app.db.models import load_runtime_settings, save_runtime_settings
+
+    db_file = tmp_path / "backfill_tz.db"
+    configure_database(db_file)
+    init_db()
+
+    now_ts = 1_800_000_000
+    with session_scope() as session:
+        rt = load_runtime_settings(session)
+        rt["history"]["backfill_enabled"] = True
+        save_runtime_settings(session, rt)
+        tk = session.get(Ticker, "AAPL")
+        assert tk is not None
+        # Store naive UTC datetime (as SQLite does on readback) and mark other starter tickers fresh
+        tk.history_backfilled_at = (datetime.now(timezone.utc) - timedelta(hours=24)).replace(tzinfo=None)
+        for other in session.query(Ticker).filter(Ticker.symbol != "AAPL").all():
+            other.history_backfilled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.commit()
+
+    monkeypatch.setattr(history_backfill, "is_gateway_reachable", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        history_backfill,
+        "fetch_daily_batch",
+        lambda syms, **kwargs: {s: _make_bars(5, end_ts=now_ts, step_sec=86400, price=200.0) for s in syms},
+    )
+    monkeypatch.setattr(
+        history_backfill,
+        "fetch_weekly_bars",
+        lambda sym, **kwargs: _make_bars(5, end_ts=now_ts, step_sec=7 * 86400, price=200.0),
+    )
+    monkeypatch.setattr(
+        history_backfill,
+        "fetch_intraday_1h",
+        lambda sym, **kwargs: _make_bars(5, end_ts=now_ts, step_sec=3600, price=200.0),
+    )
+
+    res = history_backfill.run_history_backfill_batch(max_symbols=1, force=False)
+    assert "error" not in res["message"].lower()
+    assert res["last_batch_symbols"] == ["AAPL"]

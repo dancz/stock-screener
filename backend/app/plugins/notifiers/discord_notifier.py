@@ -39,6 +39,19 @@ class DiscordNotifierPlugin(NotifierPlugin):
             )
         return self._post(url, "\n".join(lines))
 
+    def notify_paper_event(
+        self,
+        settings: dict[str, Any],
+        event_type: str,
+        title: str,
+        lines: list[str],
+    ) -> tuple[bool, str]:
+        if not self.is_configured(settings):
+            return False, "Discord not configured."
+        url = str(settings.get("notifiers", {}).get("discord_webhook_url", "")).strip()
+        body = [f"**{title}**"] + [line for line in lines if line]
+        return self._post(url, "\n".join(body))
+
     def _post(self, url: str, content: str) -> tuple[bool, str]:
         try:
             with httpx.Client(timeout=8.0) as client:

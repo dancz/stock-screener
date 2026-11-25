@@ -19,6 +19,12 @@ import { useScreenerStore } from "./store/useScreenerStore";
 
 export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"presets" | "ibkr" | "alerts" | "paper">("presets");
+
+  const openSettings = (tab: "presets" | "ibkr" | "alerts" | "paper" = "presets") => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  };
 
   const init = useScreenerStore((s) => s.init);
   const activeView = useScreenerStore((s) => s.activeView);
@@ -45,7 +51,7 @@ export function App() {
 
   return (
     <div className="flex h-screen w-screen flex-col bg-canvas text-slate-100">
-      <TopBar onOpenSettings={() => setSettingsOpen(true)} />
+      <TopBar onOpenSettings={() => openSettings("presets")} />
 
       {activeView === "trade_ideas" ? (
         <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -69,7 +75,7 @@ export function App() {
               </div>
             )}
             <ErrorBoundary resetKey="paper_trading">
-              <PaperTradingView />
+              <PaperTradingView onOpenTelegramSetup={() => openSettings("alerts")} />
             </ErrorBoundary>
           </main>
         </div>
@@ -135,7 +141,7 @@ export function App() {
         </div>
       )}
 
-      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <SettingsModal open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

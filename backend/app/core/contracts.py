@@ -259,3 +259,12 @@ class NotifierPlugin(ABC):
         regime: MarketRegime | None,
     ) -> tuple[bool, str]:
         raise NotImplementedError
+
+    def notify_paper_event(
+        self,
+        settings: dict[str, Any],
+        event_type: str,
+        title: str,
+        lines: list[str],
+    ) -> tuple[bool, str]:
+        return False, "Not implemented"

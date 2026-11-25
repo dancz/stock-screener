@@ -1,15 +1,16 @@
 import React, { useEffect, useState } from "react";
-import { CheckCircle2, Database, Plug, RefreshCw, Save, X, XCircle } from "lucide-react";
+import { CheckCircle2, Database, Plug, RefreshCw, Save, Send, ShieldCheck, X, XCircle } from "lucide-react";
 import { api } from "../api/client";
 import { useScreenerStore } from "../store/useScreenerStore";
-import type { RuntimeSettings } from "../types/screener";
+import type { IbkrPaperStatus, RuntimeSettings, TelegramDetectResponse } from "../types/screener";
 
 interface SettingsModalProps {
   open: boolean;
+  initialTab?: "presets" | "ibkr" | "alerts" | "paper";
   onClose: () => void;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) => {
+export const SettingsModal: React.FC<SettingsModalProps> = ({ open, initialTab = "presets", onClose }) => {
   const settings = useScreenerStore((s) => s.settings);
   const plugins = useScreenerStore((s) => s.plugins);
   const backfillStatus = useScreenerStore((s) => s.backfillStatus);
@@ -17,20 +18,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
   const triggerBackfill = useScreenerStore((s) => s.triggerBackfill);
   const fetchBackfillStatus = useScreenerStore((s) => s.fetchBackfillStatus);
 
-  const [tab, setTab] = useState<"presets" | "ibkr" | "alerts" | "paper">("presets");
+  const [tab, setTab] = useState<"presets" | "ibkr" | "alerts" | "paper">(initialTab);
   const [draft, setDraft] = useState<RuntimeSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [ibkrTestRes, setIbkrTestRes] = useState<{ connected: boolean; message: string } | null>(null);
   const [notifTestRes, setNotifTestRes] = useState<string | null>(null);
+  const [tgDetecting, setTgDetecting] = useState(false);
+  const [tgDetectRes, setTgDetectRes] = useState<TelegramDetectResponse | null>(null);
+  const [paperIbkrStatus, setPaperIbkrStatus] = useState<IbkrPaperStatus | null>(null);
+  const [checkingPaperIbkr, setCheckingPaperIbkr] = useState(false);
 
   useEffect(() => {
     if (open && settings) {
+      setTab(initialTab);
       setDraft(JSON.parse(JSON.stringify(settings)));
       setIbkrTestRes(null);
       setNotifTestRes(null);
+      setTgDetectRes(null);
+      setPaperIbkrStatus(null);
       fetchBackfillStatus();
     }
-  }, [open, settings, fetchBackfillStatus]);
+  }, [open, initialTab, settings, fetchBackfillStatus]);
 
   if (!open || !draft) return null;
 
@@ -54,6 +62,55 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
     await updateSettings({ notifiers: draft.notifiers });
     const res = await api.testNotifier(pluginId);
     setNotifTestRes(res.message);
+  };
+
+  const handleDetectTelegram = async () => {
+    setTgDetecting(true);
+    setTgDetectRes(null);
+    try {
+      const res = await api.detectTelegramChat(draft.notifiers.telegram_bot_token);
+      setTgDetectRes(res);
+      if (res.ok && res.suggested_chat_id && !draft.notifiers.telegram_chat_id.trim()) {
+        setDraft((prev) =>
+          prev
+            ? {
+                ...prev,
+                notifiers: {
+                  ...prev.notifiers,
+                  telegram_enabled: true,
+                  telegram_chat_id: res.suggested_chat_id || prev.notifiers.telegram_chat_id,
+                },
+              }
+            : prev
+        );
+      }
+    } catch (err) {
+      setTgDetectRes({ ok: false, chats: [], message: (err as Error).message });
+    } finally {
+      setTgDetecting(false);
+    }
+  };
+
+  const handleVerifyPaperIbkr = async () => {
+    setCheckingPaperIbkr(true);
+    try {
+      await updateSettings({ ibkr: draft.ibkr });
+      const res = await api.getPaperIbkrStatus();
+      setPaperIbkrStatus(res);
+    } catch (err) {
+      setPaperIbkrStatus({
+        connected: false,
+        paper_verified: false,
+        account: "",
+        open_orders_count: 0,
+        positions_count: 0,
+        net_liquidation: null,
+        currency: "USD",
+        message: (err as Error).message,
+      });
+    } finally {
+      setCheckingPaperIbkr(false);
+    }
   };
 
   return (
@@ -473,14 +530,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                     />
                   </label>
                 </div>
+                <div className="grid grid-cols-2 gap-3 border-t border-border/50 pt-3">
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={draft.schedule.intraday_enabled ?? true}
+                      onChange={(e) =>
+                        setDraft({
+                          ...draft,
+                          schedule: { ...draft.schedule, intraday_enabled: e.target.checked },
+                        })
+                      }
+                      className="h-4 w-4 accent-sky-500"
+                    />
+                    <span>Intraday Quick Scans (Mon–Fri US session)</span>
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-slate-300">Intraday Scan Times (HH:MM, comma-separated)</span>
+                    <input
+                      type="text"
+                      value={draft.schedule.intraday_times ?? "16:15,19:15"}
+                      onChange={(e) =>
+                        setDraft({ ...draft, schedule: { ...draft.schedule, intraday_times: e.target.value } })
+                      }
+                      className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                    />
+                  </label>
+                </div>
               </div>
 
               <div className="rounded-lg border border-border bg-canvas/80 p-4 space-y-3">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                  Optional Alert Webhooks (Telegram / Discord)
+                  Telegram Bot &amp; Discord Webhooks
                 </h3>
                 <label className="block">
-                  <span className="text-xs text-slate-300">Minimum Composite Score for Alert</span>
+                  <span className="text-xs text-slate-300">Minimum Composite Score for Scan Alerts</span>
                   <input
                     type="number"
                     min={50}
@@ -496,9 +580,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                   />
                 </label>
 
-                <div className="border-t border-border/60 pt-3 space-y-2">
+                <div className="border-t border-border/60 pt-3 space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-white">Telegram Bot</span>
+                    <div>
+                      <span className="text-xs font-semibold text-white">Telegram Bot (Alerts + Interactive Control)</span>
+                      <p className="text-[11px] text-slate-400">
+                        1. Message <code className="text-sky-300">@BotFather</code> (<code>/newbot</code>) to get your Bot Token.
+                        2. Open your new bot in Telegram and send <code>/start</code>.
+                        3. Click <strong>Verify &amp; Auto-Detect Chat ID</strong>.
+                      </p>
+                    </div>
                     <input
                       type="checkbox"
                       checked={draft.notifiers.telegram_enabled}
@@ -514,7 +605,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                   <div className="grid grid-cols-2 gap-2">
                     <input
                       type="password"
-                      placeholder="Bot Token"
+                      placeholder="Bot Token (123456:ABC...)"
                       value={draft.notifiers.telegram_bot_token}
                       onChange={(e) =>
                         setDraft({
@@ -526,7 +617,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                     />
                     <input
                       type="text"
-                      placeholder="Chat ID"
+                      placeholder="Authorized Chat ID (auto-detected or manual)"
                       value={draft.notifiers.telegram_chat_id}
                       onChange={(e) =>
                         setDraft({
@@ -537,13 +628,141 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                       className="rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
                     />
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleTestNotifier("telegram_notifier")}
-                    className="rounded border border-border bg-card px-2.5 py-1 text-[11px] text-slate-200 hover:border-sky-500"
-                  >
-                    Test Telegram
-                  </button>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleDetectTelegram}
+                      disabled={tgDetecting}
+                      className="inline-flex items-center gap-1.5 rounded border border-sky-500/40 bg-sky-500/15 px-3 py-1.5 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/25 disabled:opacity-50"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${tgDetecting ? "animate-spin" : ""}`} />
+                      <span>{tgDetecting ? "Detecting..." : "Verify & Auto-Detect Chat ID"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleTestNotifier("telegram_notifier")}
+                      className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-3 py-1.5 text-[11px] font-semibold text-slate-200 hover:border-sky-500"
+                    >
+                      <Send className="h-3 w-3 text-sky-400" />
+                      <span>Send Test Message</span>
+                    </button>
+                  </div>
+
+                  {tgDetectRes && (
+                    <div
+                      className={`rounded border px-3 py-2 text-[11px] space-y-1.5 ${
+                        tgDetectRes.ok
+                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                          : "border-rose-500/40 bg-rose-500/10 text-rose-200"
+                      }`}
+                    >
+                      <div>{tgDetectRes.message}</div>
+                      {tgDetectRes.chats.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 pt-0.5">
+                          {tgDetectRes.chats.map((c) => (
+                            <button
+                              key={c.chat_id}
+                              type="button"
+                              onClick={() =>
+                                setDraft({
+                                  ...draft,
+                                  notifiers: {
+                                    ...draft.notifiers,
+                                    telegram_enabled: true,
+                                    telegram_chat_id: c.chat_id,
+                                  },
+                                })
+                              }
+                              className={`rounded px-2 py-0.5 text-[10px] font-semibold border ${
+                                draft.notifiers.telegram_chat_id === c.chat_id
+                                  ? "border-emerald-400 bg-emerald-500/30 text-white"
+                                  : "border-border bg-panel text-slate-200 hover:border-sky-400"
+                              }`}
+                            >
+                              Use {c.label} ({c.chat_id})
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-2 rounded border border-border/60 bg-panel/60 p-2.5 text-[11px] text-slate-300">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={draft.notifiers.telegram_notify_paper_orders ?? true}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            notifiers: { ...draft.notifiers, telegram_notify_paper_orders: e.target.checked },
+                          })
+                        }
+                        className="h-3.5 w-3.5 accent-sky-500"
+                      />
+                      <span>Paper Orders (Submit / Fill / Close)</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={draft.notifiers.telegram_notify_paper_lifecycle ?? true}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            notifiers: { ...draft.notifiers, telegram_notify_paper_lifecycle: e.target.checked },
+                          })
+                        }
+                        className="h-3.5 w-3.5 accent-sky-500"
+                      />
+                      <span>Lifecycle (BE / Trailing / Exits)</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={draft.notifiers.telegram_notify_kill_switch ?? true}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            notifiers: { ...draft.notifiers, telegram_notify_kill_switch: e.target.checked },
+                          })
+                        }
+                        className="h-3.5 w-3.5 accent-sky-500"
+                      />
+                      <span>Kill-Switch &amp; Safety Alerts</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={draft.notifiers.telegram_notify_scan ?? true}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            notifiers: { ...draft.notifiers, telegram_notify_scan: e.target.checked },
+                          })
+                        }
+                        className="h-3.5 w-3.5 accent-sky-500"
+                      />
+                      <span>Daily Scan High-Conviction Summary</span>
+                    </label>
+                    <label className="col-span-2 flex items-center gap-2 border-t border-border/50 pt-1.5">
+                      <input
+                        type="checkbox"
+                        checked={draft.notifiers.telegram_commands_enabled ?? true}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            notifiers: { ...draft.notifiers, telegram_commands_enabled: e.target.checked },
+                          })
+                        }
+                        className="h-3.5 w-3.5 accent-sky-500"
+                      />
+                      <span>
+                        Interactive Bot Commands (authorized chat only: <code>/status</code>, <code>/positions</code>,{" "}
+                        <code>/trades</code>, <code>/scan</code>, <code>/halt</code>)
+                      </span>
+                    </label>
+                  </div>
                 </div>
 
                 <div className="border-t border-border/60 pt-3 space-y-2">
@@ -620,7 +839,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                         Autonomous Paper Trading Mode
                       </h3>
                       <p className="text-[11px] text-slate-400">
-                        Phase 1 runs the local SQLite virtual simulator (read-only toward IBKR). IBKR Paper order routing arrives in Phase 2.
+                        Virtual Simulator runs 100% locally in SQLite. IBKR Paper routes atomic Bracket Orders strictly to DU* paper accounts on ports 4002 / 7497.
                       </p>
                     </div>
                     <input
@@ -638,10 +857,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                         onChange={(e) => updatePaper({ mode: e.target.value as "virtual" | "ibkr_paper" })}
                         className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
                       >
-                        <option value="virtual">Virtual Simulator (Active)</option>
-                        <option value="ibkr_paper" disabled>
-                          IBKR Paper DU* (Phase 2)
-                        </option>
+                        <option value="virtual">Virtual Simulator (SQLite)</option>
+                        <option value="ibkr_paper">IBKR Paper Account (DU*)</option>
                       </select>
                     </label>
                     <label className="flex items-center gap-2 pt-5 text-xs text-slate-300">
@@ -662,6 +879,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                       />
                       Allow Short setups
                     </label>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3 border-t border-border/50 pt-2.5">
+                    <button
+                      type="button"
+                      onClick={handleVerifyPaperIbkr}
+                      disabled={checkingPaperIbkr}
+                      className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-3 py-1.5 text-xs font-semibold text-white hover:border-sky-500 disabled:opacity-50"
+                    >
+                      <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                      <span>{checkingPaperIbkr ? "Verifying DU*..." : "Verify IBKR Paper (DU*)"}</span>
+                    </button>
+                    {paperIbkrStatus && (
+                      <span
+                        className={`text-xs ${
+                          paperIbkrStatus.paper_verified ? "text-emerald-300" : "text-amber-300"
+                        }`}
+                      >
+                        {paperIbkrStatus.message}
+                        {paperIbkrStatus.paper_verified
+                          ? ` · Open Orders: ${paperIbkrStatus.open_orders_count}, Positions: ${paperIbkrStatus.positions_count}`
+                          : ""}
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -795,6 +1036,35 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ open, onClose }) =
                         step={1}
                         value={p.max_daily_new_orders}
                         onChange={(e) => updatePaper({ max_daily_new_orders: Number(e.target.value) || 5 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="flex items-center gap-2 pt-5 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={p.trailing_stop_enabled ?? true}
+                        onChange={(e) => updatePaper({ trailing_stop_enabled: e.target.checked })}
+                        className="h-4 w-4 accent-sky-500"
+                      />
+                      <span>Enable ATR Trailing Stop</span>
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Trailing Activation (R)</span>
+                      <input
+                        type="number"
+                        step={0.1}
+                        value={p.trailing_activation_r ?? 1.5}
+                        onChange={(e) => updatePaper({ trailing_activation_r: Number(e.target.value) || 1.5 })}
+                        className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs text-slate-300">Trailing ATR Multiplier</span>
+                      <input
+                        type="number"
+                        step={0.25}
+                        value={p.trailing_atr_mult ?? 2.0}
+                        onChange={(e) => updatePaper({ trailing_atr_mult: Number(e.target.value) || 2.0 })}
                         className="mt-1 w-full rounded border border-border bg-panel px-2.5 py-1.5 text-xs text-white"
                       />
                     </label>

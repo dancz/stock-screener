@@ -30,8 +30,23 @@ def _scheduled_full_scan() -> None:
     run_scan(mode="full")
 
 
+def _scheduled_intraday_scan() -> None:
+    logger.info("Running scheduled intraday quick stock scan...")
+    run_scan(mode="quick")
+
+
+def _scheduled_telegram_poll() -> None:
+    try:
+        from app.core.telegram_bot import poll_telegram_commands_once
+
+        poll_telegram_commands_once()
+    except Exception as exc:
+        logger.debug("Scheduled Telegram poll error: %s", exc)
+
+
 def _scheduled_paper_tick() -> None:
     try:
+        from app.core.paper_ibkr import step_ibkr_paper_lifecycle
         from app.core.paper_virtual import step_virtual_lifecycle
         from app.db.models import PaperTrade
 
@@ -44,8 +59,12 @@ def _scheduled_paper_tick() -> None:
                 .count()
                 > 0
             )
-            if (paper_cfg.get("enabled", False) or has_active) and paper_cfg.get("mode", "virtual") == "virtual":
-                step_virtual_lifecycle(session, runtime_settings=runtime)
+            mode = str(paper_cfg.get("mode", "virtual") or "virtual")
+            if paper_cfg.get("enabled", False) or has_active:
+                if mode == "ibkr_paper":
+                    step_ibkr_paper_lifecycle(session, runtime_settings=runtime)
+                else:
+                    step_virtual_lifecycle(session, runtime_settings=runtime)
     except Exception as exc:
         logger.warning("Scheduled paper lifecycle tick error: %s", exc)
 
@@ -57,6 +76,7 @@ def configure_scheduler(runtime_settings: dict[str, Any] | None = None) -> Backg
             runtime_settings = load_runtime_settings(session)
 
     sched_cfg = runtime_settings.get("schedule", {})
+    notif_cfg = runtime_settings.get("notifiers", {})
     tz = str(sched_cfg.get("timezone", "Europe/Prague"))
 
     if _scheduler is None:
@@ -64,6 +84,16 @@ def configure_scheduler(runtime_settings: dict[str, Any] | None = None) -> Backg
         _scheduler.start()
     else:
         _scheduler.remove_all_jobs()
+
+    if notif_cfg.get("telegram_enabled", False) and notif_cfg.get("telegram_commands_enabled", True):
+        _scheduler.add_job(
+            _scheduled_telegram_poll,
+            IntervalTrigger(seconds=20),
+            id="telegram_bot_job",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
 
     if not sched_cfg.get("enabled", True):
         logger.info("Background scan scheduler is disabled.")
@@ -84,6 +114,17 @@ def configure_scheduler(runtime_settings: dict[str, Any] | None = None) -> Backg
         id="pre_market_scan",
         replace_existing=True,
     )
+    if sched_cfg.get("intraday_enabled", True):
+        raw_times = [t.strip() for t in str(sched_cfg.get("intraday_times", "16:15,19:15")).split(",") if t.strip()]
+        for idx, hhmm in enumerate(raw_times[:4]):
+            ih, im = _parse_hhmm(hhmm, 16, 15)
+            _scheduler.add_job(
+                _scheduled_intraday_scan,
+                CronTrigger(day_of_week="mon-fri", hour=ih, minute=im, timezone=tz),
+                id=f"intraday_scan_{idx}",
+                replace_existing=True,
+            )
+
     _scheduler.add_job(
         _scheduled_paper_tick,
         CronTrigger(day_of_week="mon-fri", hour="14-22", minute="*/5", timezone=tz),

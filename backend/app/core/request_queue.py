@@ -565,3 +565,9 @@ def get_queue_stats() -> dict[str, Any]:
 def shutdown_queues() -> None:
     yahoo_queue.shutdown()
     ibkr_worker.shutdown()
+    try:
+        from app.core.paper_ibkr import ibkr_paper_worker
+
+        ibkr_paper_worker.shutdown()
+    except Exception:
+        pass

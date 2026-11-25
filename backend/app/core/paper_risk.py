@@ -37,7 +37,11 @@ def ensure_active_paper_run(
     runtime_settings: dict[str, Any] | None = None,
     now_utc: datetime | None = None,
 ) -> PaperAccountRun:
-    """Return active PaperAccountRun or create the initial virtual experiment."""
+    """Return active PaperAccountRun matching the configured execution mode, rotating cleanly on mode switch."""
+    runtime = runtime_settings or load_runtime_settings(session)
+    desired_mode = str(runtime.get("paper_trading", {}).get("mode", "virtual") or "virtual")
+    cur_dt = as_utc(now_utc) or utcnow()
+
     run = (
         session.query(PaperAccountRun)
         .filter(PaperAccountRun.is_active.is_(True))
@@ -45,16 +49,25 @@ def ensure_active_paper_run(
         .first()
     )
     if run is not None:
-        return run
+        if run.mode == desired_mode or runtime_settings is None:
+            return run
+        trade_cnt = session.query(PaperTrade).filter(PaperTrade.run_id == run.id).count()
+        if trade_cnt == 0:
+            run.mode = desired_mode
+            if run.name.startswith("Experiment #"):
+                run.name = f"Experiment #{run.id} ({'IBKR Paper' if desired_mode == 'ibkr_paper' else 'Virtual'})"
+            run.config_snapshot_json = json.dumps(runtime.get("paper_trading", {}))
+            session.flush()
+            return run
+        # Isolate runs by execution mode so virtual vs IBKR Paper results never mix
+        run.is_active = False
+        run.ended_at = cur_dt
 
-    runtime = runtime_settings or load_runtime_settings(session)
     eq = float(runtime.get("account", {}).get("equity", 25000.0) or 25000.0)
-    cur_dt = as_utc(now_utc) or utcnow()
-    mode = str(runtime.get("paper_trading", {}).get("mode", "virtual") or "virtual")
     count = session.query(PaperAccountRun).count()
     run = PaperAccountRun(
-        name=f"Experiment #{count + 1} ({'IBKR Paper' if mode == 'ibkr_paper' else 'Virtual'})",
-        mode=mode,
+        name=f"Experiment #{count + 1} ({'IBKR Paper' if desired_mode == 'ibkr_paper' else 'Virtual'})",
+        mode=desired_mode,
         initial_capital=eq,
         current_equity=eq,
         cash_balance=eq,

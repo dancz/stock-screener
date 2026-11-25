@@ -22,8 +22,12 @@ This repository contains a local-first, extensible web application for **daily U
 2. **Graceful External Feed Degradation**:
    - The app MUST work out-of-the-box with zero API keys (`yfinance`, Finviz, OpenInsider, SEC EDGAR).
    - Every external scraper/feed (Finviz, Yahoo, OpenInsider, SEC EDGAR, Finnhub) must catch network/parsing errors gracefully and degrade without crashing a scan.
-3. **Read-Only IBKR Policy**:
-   - `market_data_ibkr.py` (`ib_async`) is strictly **read-only** (market snapshots, 1H bars, option chain Greeks/IV). **NEVER** implement or invoke order placement (`placeOrder`), account modifications, or executions.
+3. **IBKR Gateway Policy (Read-Only Data + Strict Paper-Only Lock)**:
+   - `market_data_ibkr.py` and `IbkrSessionWorker` (`request_queue.py`) remain strictly **read-only** (`readonly=True`, market snapshots, 1H/1D bars, option chain Greeks/IV).
+   - Isolated order placement, modification, and cancellation are permitted **exclusively** in `backend/app/core/paper_ibkr.py` (`IbkrPaperExecutionWorker`, `clientId + 10`) and **must** pass `assert_paper_account()` before every connection and order operation:
+     - Port MUST be `4002` (IB Gateway Paper) or `7497` (TWS Paper). Any other port (`4001`, `7496`, etc.) raises `LiveAccountBlockedError`.
+     - `ib.managedAccounts()` MUST be non-empty and **every** account ID MUST start with `"DU"` or `"DF"`. Any live account (`U*`, `F*`, etc.) raises `LiveAccountBlockedError` and immediately disconnects.
+     - Every `Order` MUST explicitly set `order.account = verified_paper_account`.
    - IBKR Gateway (`host:port:clientId`) must be optional with a short connect timeout (`<= 3s`) and transparent fallback to Yahoo Finance + `black_scholes.py`.
 4. **100% English UI**:
    - All UI labels, tooltips, signal badges, option strategy names, and error messages in `frontend/` and API-returned display strings must be in English.
