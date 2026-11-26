@@ -573,7 +573,8 @@ def _update_swing_radar_leases(
             tk.discovery_sources_json = json.dumps(sorted(stored_tags))
             probation_cnt += 1
 
-    # Clean up expired leases and enforce max_tickers cap across all Ticker rows
+    # Flush ORM changes (autoflush=False) before querying all active Radar rows to enforce cap
+    session.flush()
     all_radar = session.query(Ticker).filter(Ticker.radar_until.isnot(None)).all()
     still_active: list[Ticker] = []
     for tk in all_radar:
@@ -1202,29 +1203,49 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                     _update_scan_status(processed=idx)
             session.commit()
 
-            # 4. Stage 2: Deep Enrichment for Top 85 Composite + Top 40 Short-Term High R:R + Watchlists/Paper
+            # 4. Stage 2: Deep Enrichment for Top 50 Composite + Top 45 LONG + Top 35 SHORT + Watchlists/Paper
             ranked_stage1 = sorted(
                 stage1_bundles.items(),
                 key=lambda kv: kv[1]["composite_score"],
                 reverse=True,
             )
             if mode == "full":
-                top_comp = [sym for sym, _ in ranked_stage1[:85]]
-                ranked_short_rr = sorted(
-                    stage1_bundles.items(),
-                    key=lambda kv: (
-                        float(kv[1].get("preset_scores", {}).get("short_term_high_rr", 0.0)),
-                        float(kv[1].get("composite_score", 0.0)),
-                    ),
+                def _stage1_idea_rank(item: tuple[str, dict[str, Any]]) -> float:
+                    b = item[1]
+                    comp = float(b.get("composite_score") or 0.0)
+                    s_rr = float(b.get("preset_scores", {}).get("short_term_high_rr", comp) or comp)
+                    rr_val = min(max(float(b.get("trade_plan", {}).get("risk_reward") or 0.0), 0.0), 4.5)
+                    tp1_val = float(b.get("trade_plan", {}).get("tp1_risk_reward") or 0.0)
+                    tp1_pen = -6.0 if 0.0 < tp1_val < 0.8 else 0.0
+                    return 0.5 * comp + 0.5 * s_rr + max(0.0, (rr_val - 1.5) * 3.0) + tp1_pen
+
+                top_comp = [sym for sym, _ in ranked_stage1[:50]]
+                long_cands = sorted(
+                    [
+                        kv
+                        for kv in stage1_bundles.items()
+                        if kv[1].get("trade_plan", {}).get("direction") == "LONG"
+                        and float(kv[1].get("trade_plan", {}).get("risk_reward") or 0.0) >= 1.5
+                    ],
+                    key=_stage1_idea_rank,
                     reverse=True,
                 )
-                top_short_rr = [
-                    sym
-                    for sym, b in ranked_short_rr
-                    if b.get("trade_plan", {}).get("direction") in ("LONG", "SHORT")
-                    and float(b.get("trade_plan", {}).get("risk_reward") or 0.0) >= 1.6
-                ][:40]
-                deep_symbols = set(top_comp) | set(top_short_rr) | (priority_syms & set(stage1_bundles.keys()))
+                short_cands = sorted(
+                    [
+                        kv
+                        for kv in stage1_bundles.items()
+                        if kv[1].get("trade_plan", {}).get("direction") == "SHORT"
+                        and float(kv[1].get("trade_plan", {}).get("risk_reward") or 0.0) >= 1.5
+                    ],
+                    key=_stage1_idea_rank,
+                    reverse=True,
+                )
+                deep_symbols = (
+                    set(top_comp)
+                    | {sym for sym, _ in long_cands[:45]}
+                    | {sym for sym, _ in short_cands[:35]}
+                    | (priority_syms & set(stage1_bundles.keys()))
+                )
             else:
                 deep_symbols = set(stage1_bundles.keys())
             deep_list = [sym for sym, _ in ranked_stage1 if sym in deep_symbols]

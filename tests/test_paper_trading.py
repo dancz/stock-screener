@@ -911,3 +911,28 @@ def test_swing_radar_probation_renewal_cap_and_expiry(tmp_path: Path):
         assert tk_low.radar_until is None
         assert tk_exp.radar_until is None
         assert "radar" not in json.loads(tk_exp.discovery_sources_json)
+
+        # Verify autoflush=False cap enforcement when total active Radar rows > max_tickers (min cap=10)
+        extra_rows = {}
+        for i in range(10):
+            sym = f"CAP_{i:02d}"
+            tk_cap = Ticker(symbol=sym, name=sym, discovery_sources_json=json.dumps(["finviz_movers"]))
+            session.add(tk_cap)
+            extra_rows[sym] = tk_cap
+            discovered_map[sym] = {"tags": ["finviz_movers"]}
+            final_bundles[sym] = {"composite_score": 70.0 + i * 0.2, "preset_scores": {"short_term_high_rr": 70.0}, "signals": []}
+        session.flush()
+
+        rt_capped = {**rt, "schedule": {**rt["schedule"], "radar_max_tickers": 10}}
+        stats_cap = pipeline._update_swing_radar_leases(
+            session,
+            ticker_rows={**ticker_rows, **extra_rows},
+            final_bundles=final_bundles,
+            discovered_map=discovered_map,
+            runtime_settings=rt_capped,
+            now_utc=now_dt,
+        )
+        session.commit()
+        assert stats_cap["active"] == 10
+        assert session.query(Ticker).filter(Ticker.radar_until.isnot(None)).count() == 10
+        assert tk_prob.radar_until is None  # lowest-score probation row trimmed to respect cap
