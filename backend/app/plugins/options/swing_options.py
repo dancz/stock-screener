@@ -192,6 +192,7 @@ class SwingOptionsStrategyPlugin(OptionStrategyPlugin):
                 "iv_regime": iv_regime,
                 "liquidity_ok": liquidity_ok,
                 "median_oi": int(median_oi),
+                "median_spread_pct": round(median_spread * 100.0, 1),
                 "data_source": ctx.data_source,
             },
             "risk_flags": risk_flags,

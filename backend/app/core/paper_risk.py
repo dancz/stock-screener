@@ -177,6 +177,9 @@ def evaluate_candidate_gate(
     if not idea.get("is_latest_scan", True):
         return {"approved": False, "reason": "Snapshot is from an older scan"}
 
+    if idea.get("is_deep_enriched") is False:
+        return {"approved": False, "reason": "Stage-1 snapshot only (missing deep fundamentals and earnings check)"}
+
     age_h = idea.get("snapshot_age_hours")
     if age_h is not None and float(age_h) > 16.0:
         return {"approved": False, "reason": f"Snapshot too old ({age_h}h > 16h)"}
@@ -195,6 +198,14 @@ def evaluate_candidate_gate(
     if rr < min_rr:
         return {"approved": False, "reason": f"R:R {rr:.2f}x below minimum {min_rr:.2f}x"}
 
+    min_tp1_rr = float(paper_cfg.get("min_tp1_rr", 1.0))
+    tp1_rr_raw = idea.get("tp1_risk_reward")
+    if tp1_rr_raw is not None and float(tp1_rr_raw) < min_tp1_rr:
+        return {"approved": False, "reason": f"TP1 R:R {float(tp1_rr_raw):.2f}x below minimum {min_tp1_rr:.2f}x"}
+    live_rr_tp1 = idea.get("live_rr_tp1")
+    if live_rr_tp1 is not None and float(live_rr_tp1) < max(0.85, min_tp1_rr - 0.15):
+        return {"approved": False, "reason": f"Live R:R to TP1 {float(live_rr_tp1):.2f}x too low"}
+
     if bool(idea.get("has_conflict", False)):
         return {"approved": False, "reason": "Conflicting technical/earnings signals"}
 
@@ -203,12 +214,20 @@ def evaluate_candidate_gate(
     if dte is not None and 0 <= int(dte) <= min_dte:
         return {"approved": False, "reason": f"Earnings in {int(dte)}d (<= {min_dte}d guard)"}
 
+    fgrade = str(idea.get("fundamental_grade") or idea.get("health_grade") or "")
     watchouts = [str(w).lower() for w in (idea.get("watchouts") or [])]
     for w in watchouts:
         if any(prefix in w for prefix in BLOCKING_WATCHOUT_PREFIXES):
             return {"approved": False, "reason": f"Blocked by watchout: {w}"}
-        if direction == "SHORT" and "elevated short interest" in w:
-            return {"approved": False, "reason": f"Short squeeze guard: {w}"}
+        if direction == "SHORT" and (
+            "elevated short interest" in w
+            or "insider buying" in w
+            or "shorting an rs leader" in w
+            or "rs leader outperforming" in w
+        ):
+            return {"approved": False, "reason": f"Short safety guard: {w}"}
+        if direction == "LONG" and "sharp 1d surge" in w and fgrade in ("C", "D", "F"):
+            return {"approved": False, "reason": f"Spike chase guard: {w}"}
 
     live_status = idea.get("live_status")
     if live_status in ("MISSED_ENTRY", "TARGET_HIT", "STOP_HIT"):

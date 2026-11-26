@@ -136,10 +136,17 @@ def build_trade_plan(
         risk = max(stop_loss - mid_entry, 0.25 * atr)
 
         # Respect real structural floors below entry rather than forcing TP1 through support/channel floor
-        floors = sorted(
-            [lvl for lvl in (ch_mid, nearest_sup, ch_low) if lvl is not None and lvl < entry_low - 0.35 * atr],
-            reverse=True,
-        )
+        # Exclude soft channel midline unless it offers >= 1.1R from both mid_entry and spot_price
+        floors_list = [
+            lvl
+            for lvl in (nearest_sup, ch_low)
+            if lvl is not None and lvl < entry_low - 0.55 * atr
+        ]
+        spot_risk_prelim = max(0.0, stop_loss - spot_price)
+        mid_floor_cap = min(mid_entry - 1.2 * risk, spot_price - 1.1 * spot_risk_prelim)
+        if ch_mid is not None and ch_mid <= mid_floor_cap and ch_mid < entry_low - 0.55 * atr:
+            floors_list.append(ch_mid)
+        floors = sorted(floors_list, reverse=True)
         if floors:
             tp1 = round(max(0.01, floors[0]), 2)
             tp2_cand = (
@@ -196,9 +203,17 @@ def build_trade_plan(
         risk = max(mid_entry - stop_loss, 0.25 * atr)
 
         # Respect real structural ceilings above entry rather than forcing TP1 through resistance
-        ceilings = sorted(
-            [lvl for lvl in (ch_mid, nearest_res, ch_high) if lvl is not None and lvl > entry_high + 0.35 * atr]
-        )
+        # Exclude soft channel midline unless it offers >= 1.1R from both mid_entry and spot_price
+        ceilings_list = [
+            lvl
+            for lvl in (nearest_res, ch_high)
+            if lvl is not None and lvl > entry_high + 0.55 * atr
+        ]
+        spot_risk_prelim = max(0.0, spot_price - stop_loss)
+        mid_ceil_floor = max(mid_entry + 1.2 * risk, spot_price + 1.1 * spot_risk_prelim)
+        if ch_mid is not None and ch_mid >= mid_ceil_floor and ch_mid > entry_high + 0.55 * atr:
+            ceilings_list.append(ch_mid)
+        ceilings = sorted(ceilings_list)
         if ceilings:
             tp1 = round(ceilings[0], 2)
             tp2_cand = (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import time
@@ -9,13 +11,26 @@ from typing import Any
 import httpx
 from bs4 import BeautifulSoup
 
-from app.config import BACKEND_DIR
+from app.config import BACKEND_DIR, settings
 from app.core.contracts import DiscoveredTicker, SourcePlugin
 
 logger = logging.getLogger(__name__)
 
 CACHE_PATH = BACKEND_DIR / "data" / "universe_cache.json"
 CACHE_TTL_SECONDS = 7 * 24 * 3600
+GITHUB_SP500_CSV_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+WIKIPEDIA_HEADERS = {
+    "User-Agent": "SwingPulseResearch/1.0 (https://akcie.dantm.info; contact@dantm.info) python-httpx/0.27",
+    "Accept": "text/html,application/xhtml+xml,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _get_cache_path() -> Path:
+    try:
+        return Path(settings.db_path).resolve().parent / "cache" / "universe_cache.json"
+    except Exception:
+        return CACHE_PATH
 
 SECTOR_ETF_MAP: dict[str, str] = {
     "Information Technology": "XLK",
@@ -167,12 +182,23 @@ def _normalize_yf_symbol(raw: str) -> str:
     return raw.strip().upper().replace(".", "-")
 
 
+def _http_get_text(url: str, timeout: float = 12.0) -> str:
+    try:
+        transport = httpx.HTTPTransport(local_address="0.0.0.0")
+        with httpx.Client(timeout=timeout, headers=WIKIPEDIA_HEADERS, follow_redirects=True, transport=transport) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.text
+    except (TypeError, OSError):
+        with httpx.Client(timeout=timeout, headers=WIKIPEDIA_HEADERS, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.text
+
+
 def _fetch_wikipedia_table(url: str, table_id: str | None = None) -> list[dict[str, str]]:
-    headers = {"User-Agent": "StockScreener/1.0 (local research app)"}
-    with httpx.Client(timeout=12.0, headers=headers, follow_redirects=True) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+    html = _http_get_text(url, timeout=12.0)
+    soup = BeautifulSoup(html, "lxml")
 
     table = soup.find("table", {"id": table_id}) if table_id else None
     if table is None:
@@ -197,6 +223,24 @@ def _fetch_wikipedia_table(url: str, table_id: str | None = None) -> list[dict[s
     return rows
 
 
+def _fetch_github_sp500_csv() -> list[dict[str, str]]:
+    text_csv = _http_get_text(GITHUB_SP500_CSV_URL, timeout=12.0)
+    reader = csv.DictReader(io.StringIO(text_csv))
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        sym = row.get("Symbol") or ""
+        if sym:
+            rows.append(
+                {
+                    "Symbol": sym,
+                    "Security": row.get("Security") or row.get("Name") or sym,
+                    "GICS Sector": row.get("GICS Sector") or row.get("Sector") or "",
+                    "GICS Sub-Industry": row.get("GICS Sub-Industry") or row.get("Sub-Industry") or "",
+                }
+            )
+    return rows
+
+
 class Sp500Nasdaq100UniversePlugin(SourcePlugin):
     plugin_id = "universe_sp500_ndx"
     display_name = "S&P 500 + Nasdaq 100 Universe"
@@ -208,21 +252,29 @@ class Sp500Nasdaq100UniversePlugin(SourcePlugin):
             return cached
 
         discovered: dict[str, DiscoveredTicker] = {}
+        sp_rows: list[dict[str, str]] = []
         try:
             sp_rows = _fetch_wikipedia_table("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "constituents")
-            for row in sp_rows:
-                sym = _normalize_yf_symbol(row.get("Symbol", ""))
-                if not sym:
-                    continue
-                discovered[sym] = DiscoveredTicker(
-                    symbol=sym,
-                    name=row.get("Security", sym),
-                    sector=row.get("GICS Sector", ""),
-                    industry=row.get("GICS Sub-Industry", ""),
-                    source_tag="sp500",
-                )
         except Exception as exc:
-            logger.warning("Wikipedia S&P 500 fetch failed (%s), will use fallback if needed.", exc)
+            logger.warning("Wikipedia S&P 500 fetch failed (%s), trying GitHub CSV backup.", exc)
+
+        if not sp_rows:
+            try:
+                sp_rows = _fetch_github_sp500_csv()
+            except Exception as exc:
+                logger.warning("GitHub S&P 500 CSV backup failed (%s), will use fallback if needed.", exc)
+
+        for row in sp_rows:
+            sym = _normalize_yf_symbol(row.get("Symbol", ""))
+            if not sym:
+                continue
+            discovered[sym] = DiscoveredTicker(
+                symbol=sym,
+                name=row.get("Security", sym),
+                sector=row.get("GICS Sector", ""),
+                industry=row.get("GICS Sub-Industry", ""),
+                source_tag="sp500",
+            )
 
         try:
             ndx_rows = _fetch_wikipedia_table("https://en.wikipedia.org/wiki/Nasdaq-100", "constituents")
@@ -268,21 +320,26 @@ class Sp500Nasdaq100UniversePlugin(SourcePlugin):
         return list(discovered.values())
 
     def _load_cache(self) -> list[DiscoveredTicker] | None:
-        if not CACHE_PATH.exists():
+        cache_path = _get_cache_path()
+        if not cache_path.exists():
             return None
         try:
-            age = time.time() - CACHE_PATH.stat().st_mtime
+            age = time.time() - cache_path.stat().st_mtime
             if age > CACHE_TTL_SECONDS:
                 return None
-            raw = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            return [DiscoveredTicker(**item) for item in raw]
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+            items = [DiscoveredTicker(**item) for item in raw]
+            if len(items) < 200:
+                return None
+            return items
         except Exception:
             return None
 
     def _save_cache(self, items: list[DiscoveredTicker]) -> None:
+        cache_path = _get_cache_path()
         try:
-            CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_PATH.write_text(
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
                 json.dumps([item.model_dump() for item in items], indent=2),
                 encoding="utf-8",
             )

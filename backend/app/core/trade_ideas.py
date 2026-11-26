@@ -223,8 +223,10 @@ def _compute_conviction(
     short_pct_float: float | None = None,
     has_insider_buy: bool = False,
     has_rs_leader: bool = False,
+    has_bearish_breakdown: bool = False,
     health_grade: str | None = None,
     debt_to_equity: float | None = None,
+    tp1_rr: float = 0.0,
 ) -> float:
     short_score = float(preset_scores.get("short_term_high_rr", snap.composite_score) or snap.composite_score or 0.0)
     medium_score = float(preset_scores.get("medium_term_invest", snap.composite_score) or snap.composite_score or 0.0)
@@ -275,6 +277,8 @@ def _compute_conviction(
         spot_rr_penalty -= 10.0
     if spot_rr_tp1 is not None and spot_rr_tp1 < 1.0:
         spot_rr_penalty -= 8.0
+    if 0.0 < tp1_rr < 0.75:
+        spot_rr_penalty -= 6.0
     barrier_penalty = -10.0 if target_crosses_barrier else 0.0
     stretch_penalty = -6.0 if stretched_zone else 0.0
     shock_penalty = -10.0 if abs(change_pct) >= 12.0 else 0.0
@@ -305,16 +309,25 @@ def _compute_conviction(
             elif short_pct_float >= 15.0:
                 safety_adj -= 8.0
         if health_grade in ("A+", "A") and has_rs_leader:
+            safety_adj -= 16.0
+        elif has_rs_leader and not has_bearish_breakdown:
             safety_adj -= 14.0
         elif has_rs_leader:
             safety_adj -= 8.0
         if has_insider_buy:
-            safety_adj -= 10.0
+            safety_adj -= 12.0
     else:
         if health_grade in ("D", "F"):
             safety_adj -= 15.0 if horizon == "medium_term" else 10.0
         if debt_to_equity is not None and debt_to_equity >= 300.0:
             safety_adj -= 8.0
+        if change_pct >= 8.0:
+            safety_adj -= 6.0
+            if (short_pct_float is not None and short_pct_float >= 25.0) or health_grade in ("C", "D", "F"):
+                safety_adj -= 8.0
+
+    if not snap.is_deep_enriched:
+        safety_adj -= 4.0
 
     fund_adj = 0.0
     if horizon == "medium_term":
@@ -581,6 +594,10 @@ def _build_watchouts(
         add_watchout(
             f"Extreme 1D move ({change_pct:+.1f}%) — high gap/mean-reversion noise; verify news & catalysts before entering."
         )
+    elif direction == "LONG" and change_pct >= 8.0:
+        add_watchout(
+            f"Sharp 1D surge ({change_pct:+.1f}%) — elevated pullback/squeeze-fade risk; prefer limit entry in zone."
+        )
 
     if target_crosses_barrier:
         add_watchout("TP1 lies beyond a major opposing channel/S&R boundary — confirm breakout momentum first.")
@@ -655,11 +672,36 @@ def _extract_top_option(
     tp1: float = 0.0,
     tp2: float = 0.0,
 ) -> dict[str, Any] | None:
+    iv_metrics = option_proposals.get("iv_metrics")
+    if isinstance(iv_metrics, dict) and iv_metrics:
+        med_oi = iv_metrics.get("median_oi")
+        med_spread = iv_metrics.get("median_spread_pct")
+        if med_oi is not None and int(med_oi) < 15:
+            return None
+        if med_spread is not None and float(med_spread) > 38.0:
+            return None
+
     proposals = option_proposals.get("proposals")
     if not isinstance(proposals, list):
         return None
     for prop in proposals:
         if not isinstance(prop, dict) or prop.get("bias") != target_bias:
+            continue
+
+        raw_legs = [leg for leg in (prop.get("legs") or []) if isinstance(leg, dict)]
+        illiquid_leg = False
+        for leg in raw_legs:
+            if leg.get("oi") is not None and int(leg["oi"]) < 5:
+                illiquid_leg = True
+                break
+            if leg.get("bid") is not None and leg.get("ask") is not None:
+                l_bid = float(leg.get("bid") or 0.0)
+                l_ask = float(leg.get("ask") or 0.0)
+                l_mid = float(leg.get("mid_price") or 0.0)
+                if l_bid <= 0 or l_ask <= 0 or (l_mid > 0.10 and ((l_ask - l_bid) / l_mid) > 0.40):
+                    illiquid_leg = True
+                    break
+        if illiquid_leg:
             continue
 
         raw_pop = prop.get("pop_estimate")
@@ -873,10 +915,29 @@ def build_trade_ideas(
     sells: list[dict[str, Any]] = []
     filtered_conflicted_count = 0
     filtered_low_conviction_count = 0
+    filtered_stale_count = 0
 
     for snap, ticker in rows:
         wl_ids = wl_map.get(snap.symbol, [])
         if watchlist_only and not wl_ids:
+            continue
+
+        is_latest_scan = bool(
+            latest_scan_id is None or snap.scan_run_id is None or snap.scan_run_id == latest_scan_id
+        )
+        snapshot_age_hours: float | None = None
+        if snap.analyzed_at is not None:
+            snap_dt = snap.analyzed_at if snap.analyzed_at.tzinfo else snap.analyzed_at.replace(tzinfo=timezone.utc)
+            snapshot_age_hours = round(max(0.0, (now_utc - snap_dt).total_seconds() / 3600.0), 1)
+
+        if (
+            hide_stale
+            and not watchlist_only
+            and not is_latest_scan
+            and snapshot_age_hours is not None
+            and snapshot_age_hours > 14.0
+        ):
+            filtered_stale_count += 1
             continue
 
         last_price = float(snap.last_price or 0.0)
@@ -1000,6 +1061,10 @@ def build_trade_ideas(
             or insider_buy_usd >= 100_000.0
         )
         has_rs_leader = any(isinstance(s, dict) and s.get("code") == "RS_LEADER" for s in signals)
+        has_bearish_breakdown = any(
+            isinstance(s, dict) and s.get("code") in ("CHANNEL_BREAKDOWN", "SMC_BEARISH_BOS", "BEARISH_EMA_STACK")
+            for s in signals
+        )
 
         active_short_squeeze = bool(
             direction == "SHORT"
@@ -1007,7 +1072,11 @@ def build_trade_ideas(
             and short_pct_float >= 20.0
             and change_pct >= 5.0
         )
-        shorting_quality_leader = bool(direction == "SHORT" and health_grade in ("A+", "A") and has_rs_leader)
+        shorting_quality_leader = bool(
+            direction == "SHORT"
+            and has_rs_leader
+            and (health_grade in ("A+", "A") or (health_grade == "B+" and not has_bearish_breakdown))
+        )
         imminent_earnings = bool(days_to_earnings is not None and 0 <= days_to_earnings <= 2)
         poor_risk_geometry = bool(
             ((potential_loss_pct > 14.0) or (spot_risk_pct is not None and float(spot_risk_pct) > 14.0))
@@ -1052,21 +1121,15 @@ def build_trade_ideas(
             short_pct_float=short_pct_float,
             has_insider_buy=has_insider_buy,
             has_rs_leader=has_rs_leader,
+            has_bearish_breakdown=has_bearish_breakdown,
             health_grade=health_grade,
             debt_to_equity=debt_to_equity,
+            tp1_rr=tp1_rr,
         )
 
         if min_conviction > 0 and hide_conflicted and not watchlist_only and conviction < min_conviction:
             filtered_low_conviction_count += 1
             continue
-
-        is_latest_scan = bool(
-            latest_scan_id is None or snap.scan_run_id is None or snap.scan_run_id == latest_scan_id
-        )
-        snapshot_age_hours: float | None = None
-        if snap.analyzed_at is not None:
-            snap_dt = snap.analyzed_at if snap.analyzed_at.tzinfo else snap.analyzed_at.replace(tzinfo=timezone.utc)
-            snapshot_age_hours = round(max(0.0, (now_utc - snap_dt).total_seconds() / 3600.0), 1)
 
         action_label = "Buy" if direction == "LONG" else "Short"
         setup_name = str(trade_plan.get("setup_name") or "Swing Technical Setup")
@@ -1208,7 +1271,6 @@ def build_trade_ideas(
         quotes_map = live_quote_fetcher(candidate_syms) if candidate_syms else {}
     quotes_map = quotes_map or {}
 
-    filtered_stale_count = 0
     if quotes_map:
         def _refine(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             nonlocal filtered_stale_count

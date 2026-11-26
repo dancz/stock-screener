@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.engine import Engine
@@ -40,6 +41,8 @@ class Ticker(Base):
     is_custom: Mapped[bool] = mapped_column(Boolean, default=False)
     last_enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     history_backfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    radar_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    radar_reason: Mapped[str] = mapped_column(String(120), default="")
 
     candles: Mapped[list["Candle"]] = relationship(back_populates="ticker", cascade="all, delete-orphan")
     snapshots: Mapped[list["AnalysisSnapshot"]] = relationship(back_populates="ticker", cascade="all, delete-orphan")
@@ -279,6 +282,8 @@ def init_db(db_session: Session | None = None) -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_column(engine, "tickers", "history_backfilled_at", "DATETIME")
+    _ensure_column(engine, "tickers", "radar_until", "DATETIME")
+    _ensure_column(engine, "tickers", "radar_reason", "VARCHAR(120) DEFAULT ''")
     _ensure_column(engine, "watchlists", "horizon", "VARCHAR(24) DEFAULT 'general'")
     _ensure_column(engine, "paper_trades", "trailing_active", "BOOLEAN DEFAULT 0")
     _ensure_column(engine, "paper_trades", "last_evaluated_bar_ts", "INTEGER")
@@ -354,6 +359,42 @@ def init_db(db_session: Session | None = None) -> None:
                     drawdown_pct=0.0,
                 )
             )
+
+        if session.query(Ticker).filter(Ticker.radar_until.isnot(None)).count() == 0:
+            latest_subq = (
+                session.query(
+                    AnalysisSnapshot.symbol,
+                    func.max(AnalysisSnapshot.id).label("max_id"),
+                )
+                .group_by(AnalysisSnapshot.symbol)
+                .subquery()
+            )
+            seed_rows = (
+                session.query(AnalysisSnapshot, Ticker)
+                .join(latest_subq, AnalysisSnapshot.id == latest_subq.c.max_id)
+                .join(Ticker, Ticker.symbol == AnalysisSnapshot.symbol)
+                .filter(AnalysisSnapshot.composite_score >= 64.0)
+                .order_by(AnalysisSnapshot.composite_score.desc())
+                .limit(80)
+                .all()
+            )
+            excluded_refs = {
+                "SPY", "QQQ", "IWM", "^VIX",
+                "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
+            }
+            for snap, tk in seed_rows:
+                if tk.symbol in excluded_refs:
+                    continue
+                try:
+                    src_tags = set(json.loads(tk.discovery_sources_json or "[]"))
+                except json.JSONDecodeError:
+                    src_tags = set()
+                if src_tags & {"sp500", "ndx100", "sp500+ndx100"}:
+                    continue
+                tk.radar_until = utcnow() + timedelta(days=10)
+                tk.radar_reason = f"Seeded from score {float(snap.composite_score or 0.0):.1f}"[:120]
+                src_tags.add("radar")
+                tk.discovery_sources_json = json.dumps(sorted(src_tags))
 
         session.commit()
     finally:

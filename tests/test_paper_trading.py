@@ -754,3 +754,160 @@ def test_telegram_detect_chat_and_authorized_commands(tmp_path: Path, monkeypatc
     with session_scope() as session:
         run = ensure_active_paper_run(session)
         assert run.kill_switch_triggered is True
+
+
+def test_paper_risk_blocks_stage1_low_tp1_rr_and_short_guards(tmp_path: Path):
+    configure_database(tmp_path / "paper_gates_extra.db")
+    init_db()
+    now_dt = datetime(2026, 11, 25, 16, 0, tzinfo=timezone.utc)
+
+    with session_scope() as session:
+        run = ensure_active_paper_run(session, now_utc=now_dt)
+        paper_cfg = dict(load_runtime_settings(session)["paper_trading"])
+        paper_cfg["allow_short"] = True
+
+        base_long = {
+            "symbol": "DEEP1",
+            "sector": "Industrials",
+            "direction": "LONG",
+            "is_latest_scan": True,
+            "is_deep_enriched": True,
+            "snapshot_age_hours": 0.5,
+            "conviction_score": 78.0,
+            "risk_reward": 2.3,
+            "tp1_risk_reward": 1.35,
+            "has_conflict": False,
+            "days_to_earnings": 30,
+            "fundamental_grade": "B",
+            "watchouts": [],
+            "live_status": "IN_ZONE",
+            "entry_low": 98.0,
+            "entry_high": 100.0,
+            "stop_loss": 94.0,
+            "tp1": 108.0,
+            "tp2": 114.0,
+            "last_price": 99.5,
+            "live_price": 99.5,
+        }
+
+        g_ok = evaluate_candidate_gate(session, run, base_long, paper_cfg, now_utc=now_dt)
+        assert g_ok["approved"] is True
+
+        g_stage1 = evaluate_candidate_gate(
+            session, run, {**base_long, "is_deep_enriched": False, "days_to_earnings": None}, paper_cfg, now_utc=now_dt
+        )
+        assert g_stage1["approved"] is False and "stage-1" in g_stage1["reason"].lower()
+
+        g_low_tp1 = evaluate_candidate_gate(
+            session, run, {**base_long, "tp1_risk_reward": 0.45}, paper_cfg, now_utc=now_dt
+        )
+        assert g_low_tp1["approved"] is False and "tp1 r:r" in g_low_tp1["reason"].lower()
+
+        short_base = {
+            **base_long,
+            "direction": "SHORT",
+            "entry_low": 100.0,
+            "entry_high": 102.0,
+            "stop_loss": 106.0,
+            "tp1": 93.0,
+            "tp2": 88.0,
+            "last_price": 100.5,
+            "live_price": 100.5,
+        }
+        g_insider_short = evaluate_candidate_gate(
+            session,
+            run,
+            {**short_base, "watchouts": ["Recent open-market insider buying ($192,962) opposes SHORT thesis."]},
+            paper_cfg,
+            now_utc=now_dt,
+        )
+        assert g_insider_short["approved"] is False and "insider buying" in g_insider_short["reason"].lower()
+
+        g_rs_short = evaluate_candidate_gate(
+            session,
+            run,
+            {**short_base, "watchouts": ["Shorting an RS Leader outperforming its benchmark — confirm trend breakdown first."]},
+            paper_cfg,
+            now_utc=now_dt,
+        )
+        assert g_rs_short["approved"] is False and "rs leader" in g_rs_short["reason"].lower()
+
+        g_surge = evaluate_candidate_gate(
+            session,
+            run,
+            {
+                **base_long,
+                "fundamental_grade": "C",
+                "watchouts": ["Sharp 1D surge (+9.6%) — elevated pullback/squeeze-fade risk; prefer limit entry in zone."],
+            },
+            paper_cfg,
+            now_utc=now_dt,
+        )
+        assert g_surge["approved"] is False and "spike chase" in g_surge["reason"].lower()
+
+
+def test_swing_radar_probation_renewal_cap_and_expiry(tmp_path: Path):
+    configure_database(tmp_path / "swing_radar.db")
+    init_db()
+    now_dt = datetime(2026, 11, 25, 22, 0, tzinfo=timezone.utc)
+
+    with session_scope() as session:
+        rt = load_runtime_settings(session)
+        tk_core = session.get(Ticker, "AAPL")
+        assert tk_core is not None
+        tk_core.discovery_sources_json = json.dumps(["sp500+ndx100"])
+        tk_hi = Ticker(symbol="DYN_HI", name="High Dynamic", discovery_sources_json=json.dumps(["finviz_movers"]))
+        tk_prob = Ticker(symbol="DYN_PROB", name="Probation", discovery_sources_json=json.dumps(["openinsider_feed"]))
+        tk_low = Ticker(symbol="DYN_LOW", name="Weak Mover", discovery_sources_json=json.dumps(["finviz_movers"]))
+        tk_exp = Ticker(
+            symbol="DYN_EXP",
+            name="Expired Radar",
+            discovery_sources_json=json.dumps(["finviz_movers", "radar"]),
+            radar_until=now_dt - timedelta(days=1),
+            radar_reason="Old breakout",
+        )
+        session.add_all([tk_hi, tk_prob, tk_low, tk_exp])
+        session.flush()
+
+        ticker_rows = {
+            "AAPL": tk_core,
+            "DYN_HI": tk_hi,
+            "DYN_PROB": tk_prob,
+            "DYN_LOW": tk_low,
+        }
+        discovered_map = {
+            "AAPL": {"tags": ["sp500+ndx100"]},
+            "DYN_HI": {"tags": ["finviz_movers"]},
+            "DYN_PROB": {"tags": ["openinsider_feed"]},
+            "DYN_LOW": {"tags": ["finviz_movers"]},
+        }
+        final_bundles = {
+            "AAPL": {"composite_score": 82.0, "preset_scores": {"short_term_high_rr": 80.0}, "signals": []},
+            "DYN_HI": {
+                "composite_score": 71.5,
+                "preset_scores": {"short_term_high_rr": 74.0},
+                "signals": [{"code": "SMC_AT_BULLISH_OB", "label": "At Bullish OB"}],
+            },
+            "DYN_PROB": {"composite_score": 56.0, "preset_scores": {"short_term_high_rr": 55.0}, "signals": []},
+            "DYN_LOW": {"composite_score": 44.0, "preset_scores": {"short_term_high_rr": 40.0}, "signals": []},
+        }
+        stats = pipeline._update_swing_radar_leases(
+            session,
+            ticker_rows=ticker_rows,
+            final_bundles=final_bundles,
+            discovered_map=discovered_map,
+            runtime_settings=rt,
+            now_utc=now_dt,
+        )
+        session.commit()
+
+        assert stats["extended"] == 1
+        assert stats["probation"] == 1
+        assert stats["expired"] == 1
+        assert tk_core.radar_until is None
+        assert tk_hi.radar_until is not None and (tk_hi.radar_until.replace(tzinfo=timezone.utc) - now_dt).days == 14
+        assert "radar" in json.loads(tk_hi.discovery_sources_json)
+        assert tk_prob.radar_until is not None and (tk_prob.radar_until.replace(tzinfo=timezone.utc) - now_dt).days == 7
+        assert tk_low.radar_until is None
+        assert tk_exp.radar_until is None
+        assert "radar" not in json.loads(tk_exp.discovery_sources_json)

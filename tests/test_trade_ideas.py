@@ -1187,3 +1187,155 @@ def test_trade_ideas_imminent_earnings_threshold_freshness_and_dedup(tmp_path: P
         r_low = client.get("/api/trade-ideas?min_conviction=0&hide_conflicted=false&check_live_prices=false")
         assert r_low.status_code == 200
         assert len(r_low.json()["sells"]) == 3
+
+
+def test_trade_ideas_stale_orphan_illiquid_options_and_midline_tp1(tmp_path: Path):
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.contracts import AnalyzerResult, TradeHints
+    from app.core.trade_planner import build_trade_plan
+
+    # 1. Soft channel midline < 1.0R above entry should NOT prematurely cap TP1 at 0.35R
+    results = {
+        "trend_channels": AnalyzerResult(
+            plugin_id="trend_channels",
+            display_name="Trend Channels",
+            category="technical",
+            score=76.0,
+            bias="bullish",
+            confidence=0.8,
+            summary="Near lower rail",
+            trade_hints=TradeHints(channel_lower=98.0, channel_mid=102.0, channel_upper=116.0),
+        ),
+        "price_action_sr": AnalyzerResult(
+            plugin_id="price_action_sr",
+            display_name="Price Action",
+            category="structure",
+            score=74.0,
+            bias="bullish",
+            confidence=0.8,
+            summary="At S/R",
+            trade_hints=TradeHints(atr=2.5, nearest_support=98.5, nearest_resistance=108.5),
+        ),
+    }
+    plan, _ = build_trade_plan(spot_price=100.0, results=results, overall_bias="bullish")
+    assert plan.direction == "LONG"
+    assert plan.tp1 >= 108.0
+    assert plan.tp1_risk_reward >= 1.0
+
+    # 2. Stale (>14h) orphan snapshots filtered when hide_stale=True, plus illiquid options gated out
+    configure_database(tmp_path / "stale_opt_test.db")
+    init_db()
+    now_dt = datetime.now(timezone.utc)
+    with session_scope() as session:
+        old_run = ScanRun(mode="full", status="completed", finished_at=now_dt - timedelta(hours=20))
+        new_run = ScanRun(mode="full", status="completed", finished_at=now_dt - timedelta(minutes=5))
+        session.add_all([old_run, new_run])
+        session.flush()
+
+        for sym in ("STALEOLD", "ILLQOPT", "LIQOPT"):
+            session.add(Ticker(symbol=sym, name=sym, sector="Industrials", primary_benchmark="SPY"))
+        session.flush()
+
+        long_plan = json.dumps(
+            {
+                "direction": "LONG",
+                "setup_name": "Demand Bounce",
+                "entry_low": 99.0,
+                "entry_high": 101.0,
+                "stop_loss": 95.0,
+                "tp1": 107.0,
+                "tp2": 112.0,
+                "risk_reward": 2.4,
+                "tp1_risk_reward": 1.4,
+                "index_aligned": True,
+                "index_trend": "bullish",
+            }
+        )
+        session.add(
+            AnalysisSnapshot(
+                scan_run_id=old_run.id,
+                analyzed_at=now_dt - timedelta(hours=20),
+                symbol="STALEOLD",
+                last_price=100.0,
+                composite_score=85.0,
+                bias="bullish",
+                preset_scores_json=json.dumps({"all_around_swing": 85.0, "short_term_high_rr": 85.0}),
+                trade_plan_json=long_plan,
+                is_deep_enriched=True,
+            )
+        )
+        session.add(
+            AnalysisSnapshot(
+                scan_run_id=new_run.id,
+                analyzed_at=now_dt - timedelta(minutes=2),
+                symbol="ILLQOPT",
+                last_price=100.0,
+                composite_score=78.0,
+                bias="bullish",
+                preset_scores_json=json.dumps({"all_around_swing": 78.0, "short_term_high_rr": 78.0}),
+                trade_plan_json=long_plan,
+                option_proposals_json=json.dumps(
+                    {
+                        "iv_metrics": {"median_oi": 2, "median_spread_pct": 52.0},
+                        "proposals": [
+                            {
+                                "strategy_name": "Bull Call Spread",
+                                "bias": "bullish",
+                                "expiry": "2027-01-15",
+                                "dte": 35,
+                                "legs": [{"action": "BUY", "option_type": "CALL", "strike": 100.0, "mid_price": 4.0, "oi": 2, "bid": 2.5, "ask": 5.5}],
+                                "breakeven": [104.0],
+                                "net_credit_debit": -2.0,
+                                "pop_estimate": 55.0,
+                            }
+                        ],
+                    }
+                ),
+                is_deep_enriched=True,
+            )
+        )
+        session.add(
+            AnalysisSnapshot(
+                scan_run_id=new_run.id,
+                analyzed_at=now_dt - timedelta(minutes=2),
+                symbol="LIQOPT",
+                last_price=100.0,
+                composite_score=76.0,
+                bias="bullish",
+                preset_scores_json=json.dumps({"all_around_swing": 76.0, "short_term_high_rr": 76.0}),
+                trade_plan_json=long_plan,
+                option_proposals_json=json.dumps(
+                    {
+                        "iv_metrics": {"median_oi": 180, "median_spread_pct": 6.5},
+                        "proposals": [
+                            {
+                                "strategy_name": "Bull Call Spread",
+                                "bias": "bullish",
+                                "expiry": "2027-01-15",
+                                "dte": 35,
+                                "legs": [{"action": "BUY", "option_type": "CALL", "strike": 100.0, "mid_price": 4.0, "oi": 180, "bid": 3.9, "ask": 4.1}],
+                                "breakeven": [102.0],
+                                "net_credit_debit": -2.0,
+                                "pop_estimate": 58.0,
+                            }
+                        ],
+                    }
+                ),
+                is_deep_enriched=True,
+            )
+        )
+
+    with session_scope() as session:
+        res_stale_hidden = build_trade_ideas(session, hide_stale=True, min_conviction=60.0)
+        res_stale_shown = build_trade_ideas(session, hide_stale=False, min_conviction=60.0)
+
+    buy_syms_hidden = [b["symbol"] for b in res_stale_hidden["buys"]]
+    assert "STALEOLD" not in buy_syms_hidden
+    assert res_stale_hidden["filtered_stale_count"] == 1
+    assert "STALEOLD" in [b["symbol"] for b in res_stale_shown["buys"]]
+
+    illq = next(b for b in res_stale_hidden["buys"] if b["symbol"] == "ILLQOPT")
+    liq = next(b for b in res_stale_hidden["buys"] if b["symbol"] == "LIQOPT")
+    assert illq["top_option"] is None
+    assert liq["top_option"] is not None and liq["top_option"]["strategy_name"] == "Bull Call Spread"

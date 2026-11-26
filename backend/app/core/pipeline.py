@@ -28,6 +28,7 @@ from app.db.database import session_scope
 from app.db.models import (
     AnalysisSnapshot,
     Candle,
+    PaperTrade,
     ScanRun,
     Ticker,
     WatchlistItem,
@@ -469,6 +470,155 @@ def fetch_intraday_1h_incremental(
     return merge_candle_frames(existing_df, delta_df), req_period
 
 
+_RADAR_SIGNAL_CODES = frozenset(
+    {
+        "LOWER_CHANNEL_TOUCH",
+        "CHANNEL_BREAKOUT_UP",
+        "CHANNEL_BREAKDOWN",
+        "SMC_AT_BULLISH_OB",
+        "SMC_AT_BEARISH_OB",
+        "SR_BREAK_RETEST",
+        "TTM_SQUEEZE_FIRED",
+        "INSIDER_CLUSTER_BUY",
+        "CEO_CFO_BUY",
+    }
+)
+_CORE_INDEX_TAGS = frozenset({"sp500", "ndx100", "sp500+ndx100"})
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _update_swing_radar_leases(
+    session: Session,
+    ticker_rows: dict[str, Ticker],
+    final_bundles: dict[str, dict[str, Any]],
+    discovered_map: dict[str, dict[str, Any]],
+    runtime_settings: dict[str, Any],
+    now_utc: datetime | None = None,
+) -> dict[str, int]:
+    """Grant, extend, and expire rolling Swing Radar leases for dynamic non-index discoveries."""
+    sched_cfg = runtime_settings.get("schedule", {})
+    if not bool(sched_cfg.get("radar_enabled", True)):
+        return {"active": 0, "extended": 0, "probation": 0, "expired": 0}
+
+    cur_dt = _as_utc(now_utc) or utcnow()
+    ttl_days = max(1, int(sched_cfg.get("radar_ttl_days", 14)))
+    probation_days = max(1, int(sched_cfg.get("radar_probation_days", 7)))
+    max_tickers = max(10, int(sched_cfg.get("radar_max_tickers", 120)))
+    min_score = float(sched_cfg.get("radar_min_score", 66.0))
+
+    extended_cnt = 0
+    probation_cnt = 0
+    expired_cnt = 0
+
+    for sym, tk in ticker_rows.items():
+        if sym in BENCHMARKS or sym in SECTORS:
+            continue
+        disc_tags = list(discovered_map.get(sym, {}).get("tags", []))
+        try:
+            stored_tags = set(json.loads(tk.discovery_sources_json or "[]"))
+        except json.JSONDecodeError:
+            stored_tags = set()
+        all_tags = stored_tags | set(disc_tags)
+
+        # Core S&P 500 / Nasdaq 100 members are always scanned in every full pass
+        if all_tags & _CORE_INDEX_TAGS:
+            if tk.radar_until is not None or "radar" in stored_tags:
+                tk.radar_until = None
+                tk.radar_reason = ""
+                stored_tags.discard("radar")
+                tk.discovery_sources_json = json.dumps(sorted(stored_tags))
+            continue
+
+        bundle = final_bundles.get(sym)
+        if not bundle:
+            continue
+
+        comp = float(bundle.get("composite_score") or 0.0)
+        short_rr_score = float(bundle.get("preset_scores", {}).get("short_term_high_rr") or 0.0)
+        matching_sig_label = ""
+        for sig in bundle.get("signals", []) or []:
+            if isinstance(sig, dict) and sig.get("code") in _RADAR_SIGNAL_CODES:
+                matching_sig_label = str(sig.get("label") or sig.get("code") or "")
+                break
+
+        cur_until = _as_utc(tk.radar_until)
+        is_dynamic_discovery = any(("mover" in t.lower()) or ("insider" in t.lower()) for t in disc_tags)
+        qualifies_full = bool(
+            comp >= min_score
+            or short_rr_score >= (min_score + 2.0)
+            or (matching_sig_label and comp >= 58.0)
+        )
+        qualifies_probation = bool(
+            is_dynamic_discovery and (cur_until is None or cur_until <= cur_dt) and comp >= 52.0
+        )
+
+        if qualifies_full:
+            tk.radar_until = cur_dt + timedelta(days=ttl_days)
+            if matching_sig_label:
+                tk.radar_reason = f"Score {comp:.1f} ({matching_sig_label})"[:120]
+            else:
+                tk.radar_reason = f"Score {comp:.1f} / Short-RR {short_rr_score:.1f}"[:120]
+            stored_tags.add("radar")
+            tk.discovery_sources_json = json.dumps(sorted(stored_tags))
+            extended_cnt += 1
+        elif qualifies_probation:
+            tk.radar_until = cur_dt + timedelta(days=probation_days)
+            tk.radar_reason = f"Mover/Insider probation (Score {comp:.1f})"[:120]
+            stored_tags.add("radar")
+            tk.discovery_sources_json = json.dumps(sorted(stored_tags))
+            probation_cnt += 1
+
+    # Clean up expired leases and enforce max_tickers cap across all Ticker rows
+    all_radar = session.query(Ticker).filter(Ticker.radar_until.isnot(None)).all()
+    still_active: list[Ticker] = []
+    for tk in all_radar:
+        ru = _as_utc(tk.radar_until)
+        if ru is None or ru <= cur_dt:
+            tk.radar_until = None
+            tk.radar_reason = ""
+            try:
+                tags = set(json.loads(tk.discovery_sources_json or "[]"))
+                tags.discard("radar")
+                tk.discovery_sources_json = json.dumps(sorted(tags))
+            except json.JSONDecodeError:
+                pass
+            expired_cnt += 1
+        else:
+            still_active.append(tk)
+
+    if len(still_active) > max_tickers:
+        still_active.sort(
+            key=lambda t: (
+                float((final_bundles.get(t.symbol) or {}).get("composite_score") or 0.0),
+                _as_utc(t.radar_until) or cur_dt,
+            ),
+            reverse=True,
+        )
+        for tk in still_active[max_tickers:]:
+            tk.radar_until = None
+            tk.radar_reason = ""
+            try:
+                tags = set(json.loads(tk.discovery_sources_json or "[]"))
+                tags.discard("radar")
+                tk.discovery_sources_json = json.dumps(sorted(tags))
+            except json.JSONDecodeError:
+                pass
+            expired_cnt += 1
+        still_active = still_active[:max_tickers]
+
+    return {
+        "active": len(still_active),
+        "extended": extended_cnt,
+        "probation": probation_cnt,
+        "expired": expired_cnt,
+    }
+
+
 def _load_cached_fundamentals_events(
     session: Session,
     ticker: Ticker,
@@ -873,10 +1023,16 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             scan_run_id = scan_run.id
             _update_scan_status(scan_run_id=scan_run_id)
 
-            # Collect watchlist + custom symbols
+            # Collect watchlist + custom + active/pending PaperTrade symbols
             watchlist_syms = {row[0] for row in session.query(WatchlistItem.symbol).all()}
             custom_syms = {row[0] for row in session.query(Ticker.symbol).filter(Ticker.is_custom.is_(True)).all()}
-            priority_syms = watchlist_syms | custom_syms
+            active_paper_syms = {
+                row[0]
+                for row in session.query(PaperTrade.symbol)
+                .filter(PaperTrade.status.in_(("PENDING_ENTRY", "OPEN", "PARTIAL_TP1")))
+                .all()
+            }
+            priority_syms = watchlist_syms | custom_syms | active_paper_syms
 
             daily_period, intraday_period, _ = get_active_history_periods(runtime_settings)
             ibkr_cfg = _resolve_ibkr_cfg(runtime_settings)
@@ -909,6 +1065,22 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                 if tag not in entry["tags"]:
                     entry["tags"].append(tag)
 
+            now_scan_utc = utcnow()
+            sched_cfg = runtime_settings.get("schedule", {})
+            radar_enabled = bool(sched_cfg.get("radar_enabled", True))
+            radar_cap = int(sched_cfg.get("radar_max_tickers", 120))
+            active_radar_rows: list[Ticker] = []
+            if radar_enabled and mode in ("full", "quick"):
+                radar_candidates = (
+                    session.query(Ticker)
+                    .filter(Ticker.radar_until.isnot(None))
+                    .order_by(Ticker.radar_until.desc())
+                    .all()
+                )
+                active_radar_rows = [
+                    tk for tk in radar_candidates if (_as_utc(tk.radar_until) or now_scan_utc) > now_scan_utc
+                ]
+
             if mode == "watchlists":
                 for sym in priority_syms:
                     add_disc(sym, tag="watchlist")
@@ -919,12 +1091,35 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                     if src.plugin_id in ("finviz_movers", "yahoo_movers", "openinsider_feed"):
                         for item in src.discover(runtime_settings)[:20]:
                             add_disc(item.symbol, item.name, item.sector, item.industry, item.source_tag)
+                if active_radar_rows:
+                    radar_syms = [tk.symbol for tk in active_radar_rows]
+                    latest_scores: dict[str, float] = {}
+                    subq = (
+                        session.query(AnalysisSnapshot.symbol, func.max(AnalysisSnapshot.id).label("max_id"))
+                        .filter(AnalysisSnapshot.symbol.in_(radar_syms))
+                        .group_by(AnalysisSnapshot.symbol)
+                        .subquery()
+                    )
+                    for r_sym, r_score in (
+                        session.query(AnalysisSnapshot.symbol, AnalysisSnapshot.composite_score)
+                        .join(subq, AnalysisSnapshot.id == subq.c.max_id)
+                        .all()
+                    ):
+                        latest_scores[r_sym] = float(r_score or 0.0)
+                    active_radar_rows.sort(
+                        key=lambda tk: (latest_scores.get(tk.symbol, 0.0), _as_utc(tk.radar_until) or now_scan_utc),
+                        reverse=True,
+                    )
+                    for tk in active_radar_rows[:25]:
+                        add_disc(tk.symbol, name=tk.name, sector=tk.sector, industry=tk.industry, tag="radar")
                 for sym in priority_syms:
                     add_disc(sym, tag="watchlist")
             else:
                 for src in registry.get_sources(runtime_settings.get("enabled_plugins")):
                     for item in src.discover(runtime_settings):
                         add_disc(item.symbol, item.name, item.sector, item.industry, item.source_tag)
+                for tk in active_radar_rows[:radar_cap]:
+                    add_disc(tk.symbol, name=tk.name, sector=tk.sector, industry=tk.industry, tag="radar")
                 for sym in priority_syms:
                     add_disc(sym, tag="watchlist")
 
@@ -1007,14 +1202,31 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                     _update_scan_status(processed=idx)
             session.commit()
 
-            # 4. Stage 2: Deep Enrichment for Top 90 + all Watchlists/Custom
+            # 4. Stage 2: Deep Enrichment for Top 85 Composite + Top 40 Short-Term High R:R + Watchlists/Paper
             ranked_stage1 = sorted(
                 stage1_bundles.items(),
                 key=lambda kv: kv[1]["composite_score"],
                 reverse=True,
             )
-            deep_cap = 90 if mode == "full" else len(ranked_stage1)
-            deep_symbols = set(sym for sym, _ in ranked_stage1[:deep_cap]) | (priority_syms & set(stage1_bundles.keys()))
+            if mode == "full":
+                top_comp = [sym for sym, _ in ranked_stage1[:85]]
+                ranked_short_rr = sorted(
+                    stage1_bundles.items(),
+                    key=lambda kv: (
+                        float(kv[1].get("preset_scores", {}).get("short_term_high_rr", 0.0)),
+                        float(kv[1].get("composite_score", 0.0)),
+                    ),
+                    reverse=True,
+                )
+                top_short_rr = [
+                    sym
+                    for sym, b in ranked_short_rr
+                    if b.get("trade_plan", {}).get("direction") in ("LONG", "SHORT")
+                    and float(b.get("trade_plan", {}).get("risk_reward") or 0.0) >= 1.6
+                ][:40]
+                deep_symbols = set(top_comp) | set(top_short_rr) | (priority_syms & set(stage1_bundles.keys()))
+            else:
+                deep_symbols = set(stage1_bundles.keys())
             deep_list = [sym for sym, _ in ranked_stage1 if sym in deep_symbols]
 
             _update_scan_status(
@@ -1107,6 +1319,16 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
                 if sym not in deep_enriched_bundles:
                     _save_snapshot(session, scan_run_id, sym, bundle, is_deep=False)
 
+            # Update Swing Radar rolling leases based on fresh Stage-1/Stage-2 scores
+            final_bundles = {**stage1_bundles, **deep_enriched_bundles}
+            radar_stats = _update_swing_radar_leases(
+                session,
+                ticker_rows=ticker_rows,
+                final_bundles=final_bundles,
+                discovered_map=discovered_map,
+                runtime_settings=runtime_settings,
+            )
+
             scan_run.status = "completed"
             scan_run.stage = "completed"
             scan_run.processed_tickers = len(stage1_bundles)
@@ -1117,13 +1339,14 @@ def run_scan(mode: Literal["full", "quick", "watchlists"] = "full") -> int | Non
             if pruned:
                 session.commit()
             logger.info(
-                "Scan #%s (%s) completed: analyzed=%d deep=%d cached_fundamentals=%d/%d pruned_snapshots=%d",
+                "Scan #%s (%s) completed: analyzed=%d deep=%d cached_fundamentals=%d/%d radar=%s pruned_snapshots=%d",
                 scan_run_id,
                 mode,
                 len(stage1_bundles),
                 len(deep_enriched_bundles),
                 cached_fundamentals_count,
                 len(deep_list),
+                radar_stats,
                 pruned,
             )
 
