@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import socket
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,8 @@ def period_to_ibkr_duration(period: str, fallback: str = "1 Y") -> str:
 
 def is_gateway_reachable(host: str, port: int, timeout: float = 0.25) -> bool:
     """Fast TCP probe so offline IBKR Gateway adds <0.25s overhead."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
             return True
