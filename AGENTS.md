@@ -77,11 +77,18 @@ backend\.venv\Scripts\pytest.exe -v
 npm run build --prefix frontend
 ```
 
-### Production Build & Raspberry Pi Deployment
-```powershell
-.\scripts\build-prod.ps1
+### Production & Direct Development on Raspberry Pi (`pi5` — `/home/pi/src/stock-screener`)
+- Live SQLite DB & cache live outside the Git repo at `/media/pi/Seagate8gb/tickers/screener.db` (`stock-screener.service` on port `8085`, public at `https://akcie.dantm.info`).
+```bash
+# Run tests & build directly on Raspberry Pi
+backend/.venv/bin/pytest -v
+npm run build --prefix frontend
+
+# Rebuild, test & restart systemd service in one command
+bash scripts/reload-pi.sh
+bash scripts/reload-pi.sh --skip-build   # backend-only edits
 ```
-On Raspberry Pi (ARM64 Linux):
+For fresh Raspberry Pi provisioning:
 ```bash
 bash scripts/setup-rpi.sh
 ```

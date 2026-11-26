@@ -5,7 +5,8 @@ param(
     [int]$Port = 8085,
     [string]$Domain = "akcie.dantm.info",
     [switch]$SkipBuild,
-    [switch]$SyncDb
+    [switch]$SyncDb,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,6 +18,34 @@ $SshOpts = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
 
 Push-Location $Root
 try {
+    if (-not $Force) {
+        Write-Host "[0/6] Checking $RemoteHost for uncommitted or unpushed Git work..." -ForegroundColor Cyan
+        $PreflightScript = @"
+set -euo pipefail
+if [ -d "$RemoteDir/.git" ]; then
+  if [ -n "`$(git -C "$RemoteDir" status --porcelain)" ]; then
+    echo "ABORT: $RemoteHost:$RemoteDir has uncommitted Git changes! Commit/push on $RemoteHost first, or pass -Force." >&2
+    git -C "$RemoteDir" status --short >&2
+    exit 1
+  fi
+  git -C "$RemoteDir" fetch origin main --quiet || true
+  if git -C "$RemoteDir" rev-parse --verify @{u} >/dev/null 2>&1; then
+    UNPUSHED=`$(git -C "$RemoteDir" rev-list "@{u}..HEAD")
+  else
+    UNPUSHED=`$(git -C "$RemoteDir" rev-list "origin/main..HEAD" 2>/dev/null || true)
+  fi
+  if [ -n "`$UNPUSHED" ]; then
+    echo "ABORT: $RemoteHost:$RemoteDir has unpushed commits! Push from $RemoteHost and git pull locally first, or pass -Force." >&2
+    exit 1
+  fi
+fi
+"@
+        ($PreflightScript -replace "`r`n", "`n") | & ssh @SshOpts $RemoteHost "bash -s"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Deploy aborted to protect changes on $RemoteHost."
+        }
+    }
+
     if (-not $SkipBuild) {
         Write-Host "[1/6] Building frontend production bundle..." -ForegroundColor Cyan
         npm run build --prefix (Join-Path $Root "frontend")
@@ -70,6 +99,10 @@ try {
     $RemoteScript = @"
 set -euo pipefail
 mkdir -p "$RemoteDir" "$DataDir" "$DataDir/cache"
+if [ -d "$RemoteDir/.git" ]; then
+  git -C "$RemoteDir" fetch origin main --quiet || true
+  git -C "$RemoteDir" merge --ff-only origin/main --quiet || true
+fi
 tar -xzf "$ArchiveRemote" -C "$RemoteDir"
 rm -f "$ArchiveRemote"
 sed -i 's/\r$//' "$RemoteDir/deploy/stock-screener.service" "$RemoteDir/scripts/setup-rpi.sh" "$RemoteDir/start.sh"

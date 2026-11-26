@@ -8,12 +8,22 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Ensure backend/ is importable regardless of current working directory
+# Ensure backend/ and backend/.venv site-packages are importable even under system python
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+venv_dir = BACKEND_DIR / ".venv"
+if venv_dir.exists():
+    for site_cand in (
+        venv_dir / "Lib" / "site-packages",
+        *sorted(venv_dir.glob("lib/python*/site-packages")),
+    ):
+        if site_cand.is_dir() and str(site_cand) not in sys.path:
+            sys.path.append(str(site_cand))
+
 DEFAULT_DB_PATH = BACKEND_DIR / "data" / "screener.db"
+RPI_PROD_DB_PATH = Path("/media/pi/Seagate8gb/tickers/screener.db")
 
 SERVER_NAME = "stock-screener-dev"
 SERVER_VERSION = "0.1.0"
@@ -26,7 +36,14 @@ FORBIDDEN_SQL_PATTERN = re.compile(
 
 
 def _get_db_path() -> Path:
-    return Path(os.environ.get("SCREENER_DB_PATH", str(DEFAULT_DB_PATH)))
+    env_db = os.environ.get("SCREENER_DB_PATH")
+    if env_db:
+        return Path(env_db)
+    if DEFAULT_DB_PATH.exists():
+        return DEFAULT_DB_PATH
+    if RPI_PROD_DB_PATH.exists():
+        return RPI_PROD_DB_PATH
+    return DEFAULT_DB_PATH
 
 
 def _open_readonly_conn(db_path: Path) -> sqlite3.Connection:

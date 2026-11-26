@@ -8,6 +8,7 @@ PORT="${PORT:-8085}"
 DOMAIN="${DOMAIN:-akcie.dantm.info}"
 SKIP_BUILD=0
 SYNC_DB=0
+FORCE=0
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
 while [[ $# -gt 0 ]]; do
@@ -19,8 +20,9 @@ while [[ $# -gt 0 ]]; do
     --domain) DOMAIN="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --sync-db) SYNC_DB=1; shift ;;
+    --force) FORCE=1; shift ;;
     -h|--help)
-      echo "Usage: bash deploy.sh [--host pi5] [--dir /home/pi/src/stock-screener] [--data-dir /media/pi/Seagate8gb/tickers] [--port 8085] [--domain akcie.dantm.info] [--skip-build] [--sync-db]"
+      echo "Usage: bash deploy.sh [--host pi5] [--dir /home/pi/src/stock-screener] [--data-dir /media/pi/Seagate8gb/tickers] [--port 8085] [--domain akcie.dantm.info] [--skip-build] [--sync-db] [--force]"
       exit 0
       ;;
     *)
@@ -32,6 +34,30 @@ done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+
+if [[ "$FORCE" -eq 0 ]]; then
+  echo "[0/6] Checking $REMOTE_HOST for uncommitted or unpushed Git work..."
+  ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" bash -s <<EOF
+set -euo pipefail
+if [ -d "$REMOTE_DIR/.git" ]; then
+  if [ -n "\$(git -C "$REMOTE_DIR" status --porcelain)" ]; then
+    echo "ABORT: $REMOTE_HOST:$REMOTE_DIR has uncommitted Git changes! Commit/push on $REMOTE_HOST first, or pass --force." >&2
+    git -C "$REMOTE_DIR" status --short >&2
+    exit 1
+  fi
+  git -C "$REMOTE_DIR" fetch origin main --quiet || true
+  if git -C "$REMOTE_DIR" rev-parse --verify @{u} >/dev/null 2>&1; then
+    UNPUSHED=\$(git -C "$REMOTE_DIR" rev-list "@{u}..HEAD")
+  else
+    UNPUSHED=\$(git -C "$REMOTE_DIR" rev-list "origin/main..HEAD" 2>/dev/null || true)
+  fi
+  if [ -n "\$UNPUSHED" ]; then
+    echo "ABORT: $REMOTE_HOST:$REMOTE_DIR has unpushed commits! Push from $REMOTE_HOST and git pull locally first, or pass --force." >&2
+    exit 1
+  fi
+fi
+EOF
+fi
 
 ARCHIVE_LOCAL="$(mktemp /tmp/stock-screener-deploy-XXXXXX.tar.gz)"
 ARCHIVE_REMOTE="/tmp/stock-screener-deploy.tar.gz"
@@ -83,6 +109,10 @@ echo "[4/6] Installing dependencies, configuring systemd (DB -> $DATA_DIR) & res
 ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" bash -s <<EOF
 set -euo pipefail
 mkdir -p "$REMOTE_DIR" "$DATA_DIR" "$DATA_DIR/cache"
+if [ -d "$REMOTE_DIR/.git" ]; then
+  git -C "$REMOTE_DIR" fetch origin main --quiet || true
+  git -C "$REMOTE_DIR" merge --ff-only origin/main --quiet || true
+fi
 tar -xzf "$ARCHIVE_REMOTE" -C "$REMOTE_DIR"
 rm -f "$ARCHIVE_REMOTE"
 sed -i 's/\r$//' "$REMOTE_DIR/deploy/stock-screener.service" "$REMOTE_DIR/scripts/setup-rpi.sh" "$REMOTE_DIR/start.sh"
